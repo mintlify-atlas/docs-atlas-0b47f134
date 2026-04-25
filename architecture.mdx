@@ -1,0 +1,126 @@
+---
+title: "Relay architecture overview"
+description: "A three-layer system where Next.js talks to NestJS over HTTP and Socket.io, and audio/video travels peer-to-peer via WebRTC — the server never sees plaintext."
+---
+
+Relay is designed around a single constraint: the server must never be able to read a message. Every architectural choice — the storage strategy, the key model, the way media is uploaded — follows from that requirement. The result is a three-layer stack where the frontend handles all encryption and decryption, the backend relays ciphertext and coordinates connections, and Postgres (or in-memory storage) persists opaque blobs that are meaningless without the per-user keys that never leave the browser.
+
+## System diagram
+
+The diagram below, taken directly from the project plan, shows how the layers connect and where each protocol is used.
+
+```
+Next.js (client)  ──HTTP──►  NestJS REST  ──►  Prisma ──►  Postgres (Neon)
+      │                         │
+      └──── Socket.io (WSS) ────┘
+                │
+         WebRTC signaling only
+                ▼
+        Browser ◄──P2P──► Browser   (audio/video never touches server)
+
+Cloudinary: client uploads already-encrypted blobs. Server stores the URL.
+```
+
+Three things to keep in mind when reading the rest of this page:
+
+1. **The server relays ciphertext.** It never sees plaintext messages or media.
+2. **Socket.io does double duty** — it carries both chat messages and WebRTC signaling over the same persistent connection.
+3. **WebRTC media is peer-to-peer**, so there is no media server to run or operate.
+
+## The three layers
+
+<CardGroup cols={3}>
+  <Card title="Next.js client" icon="browser">
+    The frontend is a Next.js 16 app using the App Router. It handles key generation (`libsodium-wrappers`), AES-256-GCM encryption before send, decryption after receive, and WebRTC call UI. Keys live in IndexedDB, wrapped with a password-derived key — they never leave the browser.
+  </Card>
+  <Card title="NestJS backend" icon="server">
+    The backend is a NestJS 11 application exposing both a REST API (auth, users, conversations, media) and a Socket.io gateway (`ChatGateway`) on the same process. It stores and forwards ciphertext, enforces membership checks, and relays WebRTC signaling packets. It has no access to any encryption keys.
+  </Card>
+  <Card title="Postgres / Neon" icon="database">
+    Prisma 6 connects to a Postgres database (Neon free tier in the reference deployment). All message content stored here is ciphertext. If `DATABASE_URL` is left empty, the backend substitutes `InMemoryChatStrategy` and no database is needed at all.
+  </Card>
+</CardGroup>
+
+## Socket.io: chat and signaling on one connection
+
+The `ChatGateway` (`relay-backend/src/chat/chat.gateway.ts`) is the central hub for all real-time traffic. On connection, it authenticates the socket using the same JWT that protects the REST routes, then joins the client to a personal room (`user:<userId>`) so conversation notifications can be delivered even when the client is not actively viewing a conversation.
+
+The gateway handles two distinct categories of event:
+
+**Chat events** — `chat:join`, `chat:leave`, `chat:send`, `temp:toggle`. When a message arrives, the gateway delegates to `ChatService`, which publishes to an RxJS subject. The gateway subscribes to that subject in `onModuleInit` and broadcasts the result to the conversation room:
+
+```typescript
+onModuleInit() {
+  this.chat.messageCreated$.subscribe((event) => {
+    this.server.to(event.conversationId).emit('message:new', event.message);
+  });
+}
+```
+
+**WebRTC signaling events** — `call:offer`, `call:answer`, `call:ice-candidate`, `call:reject`, `call:hangup`. Each handler validates that the caller is a member of the conversation, then forwards the payload to the target user's personal room. No call state is persisted on the server:
+
+```typescript
+@SubscribeMessage('call:offer')
+async handleCallOffer(
+  @ConnectedSocket() client: AuthedSocket,
+  @MessageBody()
+  payload: {
+    conversationId: string;
+    recipientId: string;
+    offer: RTCSessionDescriptionInit;
+    isVideo: boolean;
+  },
+) {
+  const userId = this.requireUser(client);
+  const conv = await this.chat.findMembership(payload.conversationId, userId);
+  if (!conv) throw new WsException('Not a member of this conversation');
+  this.server.to(`user:${payload.recipientId}`).emit('call:incoming', {
+    callerId: userId,
+    conversationId: payload.conversationId,
+    offer: payload.offer,
+    isVideo: payload.isVideo,
+  });
+  return { ok: true };
+}
+```
+
+Once both browsers have exchanged an offer, answer, and ICE candidates through the server, the WebRTC peer connection is established and all audio/video travels directly between browsers. Google STUN is used for NAT traversal; no TURN server is configured.
+
+## NestJS module structure
+
+The root `AppModule` composes five feature modules, each with a focused responsibility:
+
+```typescript
+@Module({
+  imports: [
+    ConfigModule.forRoot({ isGlobal: true }),
+    CommonModule,   // PrismaService singleton, @CurrentUser() decorator
+    AuthModule,     // email+password signup/login, JWT + refresh cookie
+    UsersModule,    // user profile + key-bundle endpoints
+    ChatModule,     // REST controllers + ChatGateway + storage strategy
+    MediaModule,    // Cloudinary signed-upload endpoint
+  ],
+})
+export class AppModule {}
+```
+
+`ChatModule` is the most complex: it contains the REST controllers, `ChatGateway`, `ChatService`, and the storage provider that selects between `DatabaseChatStrategy` and `InMemoryChatStrategy` at runtime based on the presence of `DATABASE_URL`.
+
+## Data model
+
+The Prisma schema enforces the privacy guarantee at the column level. Every column that could reveal message content stores ciphertext or a URL to ciphertext — there is no plaintext body column.
+
+| Model | Purpose |
+|---|---|
+| `User` | Identity record. Stores `passwordHash` but no keys. |
+| `KeyBundle` | Public key material (`identityPubKey`, `exchangePubKey`) plus `wrappedPrivateKeys` — an opaque ciphertext blob the server cannot unwrap. |
+| `Conversation` | Metadata only: `type` (`DIRECT` or `GROUP`), optional `name`, `createdAt`. |
+| `Membership` | Join table between `User` and `Conversation` with a `role` (`OWNER`, `ADMIN`, `MEMBER`). |
+| `ConversationKey` | Per-user wrapped copy of the conversation symmetric key. Opaque to the server. |
+| `Message` | The `ciphertext` and `nonce` columns are what the server stores — never the plaintext. |
+| `MediaAsset` | Plaintext metadata only (`cloudinaryUrl`, `mime`, `size`). The file bytes on Cloudinary are already ciphertext uploaded by the client. |
+| `Session` | Stores a `refreshTokenHash` (not the token itself) and an `expiresAt` timestamp for JWT refresh rotation. |
+
+<Note>
+  The server could read every column in the database and still not read a single message. All decryption happens in the browser using keys that are wrapped with a password-derived secret and stored in IndexedDB.
+</Note>

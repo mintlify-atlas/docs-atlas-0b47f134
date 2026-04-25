@@ -1,0 +1,160 @@
+---
+title: "Group member management endpoints"
+description: "Add or remove members from group conversations as the group owner. Includes guidance on rotating the AES-256-GCM conversation key after every membership change."
+---
+
+Group membership is managed by the conversation owner — the user who created the group. Members cannot add or remove each other; only the owner has that authority. When a new member is added, the owner must supply a freshly wrapped copy of the group's AES-256-GCM conversation key encrypted to the new member's X25519 exchange key, so the new member can immediately read and send messages without any additional key negotiation.
+
+All endpoints require a Bearer token in the `Authorization` header.
+
+<Warning>
+  Removing a member from a group does **not** automatically rotate the conversation key. The removed user retains their copy of the current key and could decrypt any future messages they intercept before the key is changed. After removing a member, the owner must generate a new conversation key, re-wrap it for all remaining members, and call `POST /chat/conversations/:id/keys` to distribute the new wrapped keys. Failure to do so means forward secrecy is not preserved.
+</Warning>
+
+---
+
+## POST /chat/conversations/:id/members
+
+Add a new member to a group conversation. The caller must be the conversation owner. The new member receives a wrapped copy of the conversation key so they can decrypt existing and future messages. If you want to limit the new member's access to only future messages, generate and distribute a new conversation key (via `POST /chat/conversations/:id/keys`) after adding them.
+
+**Method:** `POST`  
+**Path:** `/chat/conversations/:id/members`  
+**Auth:** Bearer token required; caller must be the group owner
+
+### Path parameters
+
+<ParamField path="id" type="string" required>
+  UUID of the group conversation.
+</ParamField>
+
+### Request body
+
+<ParamField body="userId" type="string" required>
+  UUID of the user to add as a member.
+</ParamField>
+
+<ParamField body="wrappedKey" type="string" required>
+  The group's AES-256-GCM conversation key wrapped with the new member's X25519 exchange public key. Retrieve the new member's exchange key from `GET /users/:id/keys` before calling this endpoint.
+</ParamField>
+
+### Response
+
+Returns the updated `EnrichedConversation` object reflecting the new membership. See [Conversation management](/api/chat/conversations) for the full response shape.
+
+<ResponseField name="id" type="string" required>
+  UUID of the conversation.
+</ResponseField>
+
+<ResponseField name="memberIds" type="string[]" required>
+  Updated array of member UUIDs, now including the newly added user.
+</ResponseField>
+
+<ResponseField name="memberNames" type="object" required>
+  Updated map of `userId → displayName` for all current members.
+</ResponseField>
+
+<ResponseField name="memberEmails" type="object" required>
+  Updated map of `userId → email` for all current members.
+</ResponseField>
+
+<ResponseField name="ownerId" type="string" required>
+  UUID of the group owner. Unchanged by this operation.
+</ResponseField>
+
+### Example
+
+```bash
+curl -X POST https://api.relay.example/chat/conversations/conv-0000-0000-0000-000000000002/members \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "userId": "d4e5f6a7-0000-0000-0000-000000000004",
+    "wrappedKey": "wrapped-conv-key-for-dave=="
+  }'
+```
+
+```json
+{
+  "id": "conv-0000-0000-0000-000000000002",
+  "type": "GROUP",
+  "name": "Engineering",
+  "memberIds": [
+    "a1b2c3d4-0000-0000-0000-000000000001",
+    "b2c3d4e5-0000-0000-0000-000000000002",
+    "c3d4e5f6-0000-0000-0000-000000000003",
+    "d4e5f6a7-0000-0000-0000-000000000004"
+  ],
+  "memberNames": {
+    "a1b2c3d4-0000-0000-0000-000000000001": "Alice",
+    "b2c3d4e5-0000-0000-0000-000000000002": "Bob",
+    "c3d4e5f6-0000-0000-0000-000000000003": "Carol",
+    "d4e5f6a7-0000-0000-0000-000000000004": "Dave"
+  },
+  "memberEmails": {
+    "a1b2c3d4-0000-0000-0000-000000000001": "alice@example.com",
+    "b2c3d4e5-0000-0000-0000-000000000002": "bob@example.com",
+    "c3d4e5f6-0000-0000-0000-000000000003": "carol@example.com",
+    "d4e5f6a7-0000-0000-0000-000000000004": "dave@example.com"
+  },
+  "ownerId": "a1b2c3d4-0000-0000-0000-000000000001",
+  "temporary": false,
+  "tempSessionSince": null,
+  "createdAt": "2024-03-01T12:05:00.000Z",
+  "lastMessage": null
+}
+```
+
+---
+
+## DELETE /chat/conversations/:id/members/:userId
+
+Remove a member from a group conversation. The caller must be the conversation owner. The owner cannot remove themselves — to leave a group conversation you own, delete the entire conversation instead. Returns `204 No Content` on success.
+
+**Method:** `DELETE`  
+**Path:** `/chat/conversations/:id/members/:userId`  
+**Auth:** Bearer token required; caller must be the group owner  
+**Response:** `204 No Content`
+
+### Path parameters
+
+<ParamField path="id" type="string" required>
+  UUID of the group conversation.
+</ParamField>
+
+<ParamField path="userId" type="string" required>
+  UUID of the member to remove.
+</ParamField>
+
+### Key rotation after removal
+
+After the `204` response, perform the following steps on the client to preserve forward secrecy:
+
+1. Generate a new random AES-256-GCM conversation key.
+2. For each remaining member, fetch their exchange public key from `GET /users/:id/keys` and produce a new wrapped copy of the key.
+3. Call `POST /chat/conversations/:id/keys` with the full `wrappedKeys` map for all remaining members.
+
+Future messages encrypted with the new key cannot be decrypted by the removed member even if they captured previous traffic.
+
+### Example
+
+```bash
+curl -X DELETE \
+  "https://api.relay.example/chat/conversations/conv-0000-0000-0000-000000000002/members/d4e5f6a7-0000-0000-0000-000000000004" \
+  -H "Authorization: Bearer $TOKEN"
+```
+
+After receiving `204`, rotate the key for remaining members:
+
+```bash
+curl -X POST \
+  "https://api.relay.example/chat/conversations/conv-0000-0000-0000-000000000002/keys" \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "wrappedKeys": {
+      "a1b2c3d4-0000-0000-0000-000000000001": "new-wrapped-key-for-alice==",
+      "b2c3d4e5-0000-0000-0000-000000000002": "new-wrapped-key-for-bob==",
+      "c3d4e5f6-0000-0000-0000-000000000003": "new-wrapped-key-for-carol=="
+    }
+  }'
+```

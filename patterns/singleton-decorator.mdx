@@ -1,0 +1,165 @@
+---
+title: "Singleton and Decorator patterns in Relay"
+description: "PrismaService is instantiated once per process to share a single connection pool; decorators like @CurrentUser() keep auth plumbing out of route handler bodies."
+---
+
+Two structural patterns keep Relay's infrastructure concerns from spreading into application code. The Singleton pattern ensures that expensive resources — the database connection pool and the client-side encryption key cache — are created exactly once and shared. The Decorator pattern ensures that cross-cutting concerns like authentication checks and user extraction are expressed as reusable annotations rather than repeated function calls inside every handler.
+
+<Tabs>
+  <Tab title="Singleton pattern">
+
+## The problem
+
+NestJS instantiates providers lazily by default, and without care it is possible to end up with multiple instances of a class that manages a shared resource. For `PrismaClient`, each instance opens its own connection pool to Postgres. In a typical NestJS application with several modules all injecting a database service, this can exhaust the database's connection limit quickly. On the client, the same issue applies to the encryption key cache: if `KeyStore` is re-instantiated per component, different parts of the UI can hold different copies of the same conversation key.
+
+## PrismaService as a NestJS singleton
+
+NestJS providers are module-scoped singletons by default: one instance per module. When `PrismaService` is registered in a shared `CommonModule` that is imported by other modules, NestJS instantiates it exactly once across the entire application. Every controller, service, and strategy that injects `PrismaService` receives the same instance — and therefore shares one `PrismaClient` connection pool.
+
+```typescript prisma.service.ts
+/**
+ * Singleton pattern:
+ * Nest providers are singletons, so every module that injects PrismaService
+ * shares one PrismaClient instance — one connection pool for the whole app.
+ *
+ * If DATABASE_URL is empty we skip the Prisma connect entirely; the app
+ * will run on the in-memory chat strategy (see ChatStorageProvider).
+ */
+@Injectable()
+export class PrismaService
+  extends PrismaClient
+  implements OnModuleInit, OnModuleDestroy
+{
+  private readonly logger = new Logger(PrismaService.name);
+  private readonly enabled: boolean;
+
+  constructor() {
+    const enabled = Boolean(process.env.DATABASE_URL);
+    super(
+      enabled
+        ? undefined
+        : { datasources: { db: { url: 'postgresql://disabled:disabled@localhost:5432/disabled' } } },
+    );
+    this.enabled = enabled;
+  }
+
+  async onModuleInit() {
+    if (!this.enabled) {
+      this.logger.warn('DATABASE_URL not set — Prisma will not connect.');
+      return;
+    }
+    await this.$connect();
+    this.logger.log('Prisma connected');
+  }
+
+  async onModuleDestroy() {
+    if (this.enabled) await this.$disconnect();
+  }
+}
+```
+
+`onModuleInit` and `onModuleDestroy` hooks guarantee the connection is opened once on boot and closed cleanly on shutdown — there is no possibility of a second `$connect()` call from a duplicate instance.
+
+## KeyStore on the client
+
+On the Next.js client, `KeyStore` is a module-level singleton. Because it is exported as a single constructed object rather than a class, every React component that imports it shares the same in-memory map of conversation keys. There is no risk of one component decrypting a message with a stale key while another holds an updated copy.
+
+```typescript key-store.ts
+class KeyStore {
+  private readonly keys = new Map<string, CryptoKey>();
+
+  set(conversationId: string, key: CryptoKey) {
+    this.keys.set(conversationId, key);
+  }
+
+  get(conversationId: string): CryptoKey | undefined {
+    return this.keys.get(conversationId);
+  }
+}
+
+// Module-scoped singleton — one instance for the whole app
+export const keyStore = new KeyStore();
+```
+
+## Benefit
+
+One Prisma connection pool means the database sees one set of connections regardless of how many NestJS modules are active. One `KeyStore` instance means all components decrypt with the same key — no desynced caches, no stale keys after a conversation key rotation.
+
+  </Tab>
+  <Tab title="Decorator pattern">
+
+## The problem
+
+Without metadata decorators, every route handler that requires an authenticated user must repeat the same extraction logic:
+
+```typescript
+// Without decorators — cluttered handler
+@Get('me')
+async getMe(@Req() req: Request) {
+  const user = req.user as { sub: string; email: string };
+  if (!user) throw new UnauthorizedException();
+  return this.usersService.findById(user.sub);
+}
+```
+
+Multiplied across dozens of endpoints, this becomes a maintenance problem: changing the shape of the JWT payload means editing every handler individually.
+
+## @CurrentUser()
+
+The `@CurrentUser()` decorator wraps `createParamDecorator` to pull the authenticated user off `req.user` once, in one place.
+
+```typescript current-user.decorator.ts
+export interface AuthenticatedUser {
+  sub: string;
+  email: string;
+}
+
+/**
+ * Decorator pattern: pulls the authenticated user off the request without
+ * every handler having to touch `req.user` directly.
+ *   @Get('me')
+ *   me(@CurrentUser() user: AuthenticatedUser) { ... }
+ */
+export const CurrentUser = createParamDecorator(
+  (_data: unknown, ctx: ExecutionContext): AuthenticatedUser => {
+    const req = ctx.switchToHttp().getRequest();
+    return req.user as AuthenticatedUser;
+  },
+);
+```
+
+## @UseGuards(JwtAuthGuard)
+
+`JwtAuthGuard` extends Passport's `AuthGuard('jwt')` and is applied at the controller or handler level via `@UseGuards()`. NestJS runs the guard before the handler body, so the handler can assume the user is authenticated.
+
+```typescript jwt-auth.guard.ts
+@Injectable()
+export class JwtAuthGuard extends AuthGuard('jwt') {}
+```
+
+A protected route using both decorators together looks like this:
+
+```typescript
+@UseGuards(JwtAuthGuard)
+@Get('me')
+me(@CurrentUser() user: AuthenticatedUser) {
+  return this.usersService.findById(user.sub);
+}
+```
+
+The handler body contains only business logic. Authentication, token verification, and user extraction are applied transparently as metadata annotations.
+
+## @Injectable()
+
+`@Injectable()` is NestJS's own decorator that marks a class as a provider available for dependency injection. It attaches type metadata at the class level so NestJS's DI container can resolve constructor parameters automatically — without any manual wiring.
+
+## Benefit
+
+Authentication concerns are defined once in `JwtAuthGuard` and `@CurrentUser()` and applied with a single annotation. Adding a new protected endpoint requires two lines of decorator syntax, not ten lines of inline auth logic. If the JWT payload shape changes, only the decorator implementation changes — all handlers are updated automatically.
+
+<Tip>
+  `@CurrentUser()` works only on routes already protected by `@UseGuards(JwtAuthGuard)`. Without the guard, `req.user` is undefined and the decorator returns `undefined` rather than throwing — guard your routes explicitly.
+</Tip>
+
+  </Tab>
+</Tabs>

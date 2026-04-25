@@ -1,0 +1,127 @@
+---
+title: "Observer pattern: reactive event broadcasting"
+description: "RxJS Subjects in ChatService publish domain events; ChatGateway subscribes and broadcasts to Socket.io rooms, decoupling persistence from real-time delivery."
+---
+
+Relay's backend handles two responsibilities that must remain separate: persisting chat data (or routing it through the Strategy layer) and broadcasting events to connected clients over Socket.io. The Observer pattern keeps these concerns independent. `ChatService` publishes domain events onto RxJS `Subject` streams. `ChatGateway` subscribes to those streams on startup and handles the Socket.io broadcast. Neither class directly calls the other's methods for event emission.
+
+## The problem
+
+Without this separation, `ChatService.sendMessage()` would call `this.gateway.server.to(roomId).emit(...)` directly. That means:
+
+- `ChatService` needs a reference to `ChatGateway`, creating a circular dependency (`ChatGateway` already injects `ChatService`).
+- Adding a second consumer — for example, an unread-badge counter or a push-notification service — requires editing `sendMessage()` and every other publish point.
+- Unit-testing `ChatService` requires mocking a Socket.io server.
+
+## The Subject declarations
+
+All seven event streams are declared as public `readonly` fields on `ChatService`. Any code that can see the service instance can subscribe without the service knowing.
+
+```typescript chat.service.ts
+@Injectable()
+export class ChatService {
+  /**
+   * Observer pattern publisher. The gateway subscribes and broadcasts.
+   * Other subscribers (notifications, unread counters, analytics) can
+   * plug in without touching the publish site below.
+   */
+  readonly messageCreated$ = new Subject<MessageCreatedEvent>();
+  readonly conversationCreated$ = new Subject<ConversationCreatedEvent>();
+  readonly conversationDeleted$ = new Subject<ConversationDeletedEvent>();
+  readonly tempStarted$ = new Subject<TempSessionEvent>();
+  readonly tempEnded$ = new Subject<TempSessionEvent>();
+  readonly memberAdded$ = new Subject<{
+    conversationId: string;
+    addedUserId: string;
+    memberIds: string[];
+  }>();
+  readonly memberRemoved$ = new Subject<{
+    conversationId: string;
+    removedUserId: string;
+    remainingMemberIds: string[];
+  }>();
+}
+```
+
+Each Subject emits a typed event object. `Subject` is used rather than `EventEmitter` because RxJS operators (throttle, filter, buffer) can be applied to the stream later without changing the publish site.
+
+## The gateway subscribes in onModuleInit
+
+`ChatGateway` receives `ChatService` via constructor injection and wires up all subscriptions in the `onModuleInit` lifecycle hook — after NestJS has finished bootstrapping the module graph and the Socket.io server is ready.
+
+```typescript chat.gateway.ts
+onModuleInit() {
+  this.chat.messageCreated$.subscribe((event) => {
+    this.server.to(event.conversationId).emit('message:new', event.message);
+  });
+  this.chat.conversationCreated$.subscribe((event) => {
+    // Notify each member via their personal room so they can refresh their list
+    for (const memberId of event.conv.memberIds) {
+      this.server
+        .to(`user:${memberId}`)
+        .emit('conv:new', { conversationId: event.conv.id });
+    }
+  });
+  this.chat.conversationDeleted$.subscribe((event) => {
+    for (const memberId of event.memberIds) {
+      this.server
+        .to(`user:${memberId}`)
+        .emit('conv:deleted', { conversationId: event.conversationId });
+    }
+  });
+  this.chat.tempStarted$.subscribe((event) => {
+    this.server.to(event.conversationId).emit('temp:started', {
+      conversationId: event.conversationId,
+      since: event.since.toISOString(),
+    });
+  });
+  this.chat.tempEnded$.subscribe((event) => {
+    this.server.to(event.conversationId).emit('temp:ended', {
+      conversationId: event.conversationId,
+      since: event.since.toISOString(),
+    });
+  });
+  this.chat.memberAdded$.subscribe((event) => {
+    // Notify the new member so their sidebar picks up the conversation
+    this.server
+      .to(`user:${event.addedUserId}`)
+      .emit('conv:new', { conversationId: event.conversationId });
+    // Notify everyone already in the room to refresh their member list
+    this.server.to(event.conversationId).emit('group:member-added', {
+      conversationId: event.conversationId,
+      userId: event.addedUserId,
+    });
+  });
+  this.chat.memberRemoved$.subscribe((event) => {
+    // Tell the removed user their membership is gone
+    this.server
+      .to(`user:${event.removedUserId}`)
+      .emit('group:kicked', { conversationId: event.conversationId });
+    // Tell remaining members to refresh (and rotate key cache)
+    this.server.to(event.conversationId).emit('group:member-removed', {
+      conversationId: event.conversationId,
+      userId: event.removedUserId,
+    });
+  });
+}
+```
+
+## All events at a glance
+
+| Subject | Emitted when | Socket.io event(s) sent |
+|---|---|---|
+| `messageCreated$` | A message is saved to storage | `message:new` → conversation room |
+| `conversationCreated$` | A new conversation is created | `conv:new` → each member's personal room |
+| `conversationDeleted$` | A conversation is deleted | `conv:deleted` → each member's personal room |
+| `tempStarted$` | Temporary-chat mode is toggled on | `temp:started` → conversation room |
+| `tempEnded$` | Temporary-chat mode is toggled off | `temp:ended` → conversation room |
+| `memberAdded$` | A user is added to a group | `conv:new` → new member; `group:member-added` → conversation room |
+| `memberRemoved$` | A user is removed from a group | `group:kicked` → removed user; `group:member-removed` → conversation room |
+
+## Benefit
+
+`ChatService` publishes with a single `.next()` call and has no import from `@nestjs/websockets` or `socket.io`. The publish site never changes when new consumers are added. A push-notification service, an unread-badge counter, or an analytics logger can each subscribe to any of the seven streams independently, in their own module, without touching `chat.service.ts` or `chat.gateway.ts`.
+
+<Info>
+  Each connected client automatically joins a personal room named `user:{userId}` on authentication (see `handleConnection` in `chat.gateway.ts`). This is how personal notifications like `conv:new` and `group:kicked` reach the right socket without broadcasting to everyone.
+</Info>

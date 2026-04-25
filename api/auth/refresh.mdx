@@ -1,0 +1,56 @@
+---
+title: "POST /auth/refresh — rotate access token"
+description: "POST /auth/refresh exchanges the relay_refresh cookie for a new JWT access token. The old refresh token is immediately revoked — each token is single-use."
+---
+
+Access tokens are intentionally short-lived. When one expires, call this endpoint to obtain a new one without asking the user to log in again. The server reads the `relay_refresh` cookie that was set during login or signup, verifies it against the stored session, and then performs a token rotation: the old refresh token is revoked and a brand-new pair of tokens is issued. If the cookie is missing, expired, or has already been used, the request is rejected and the user must authenticate again.
+
+## Endpoint
+
+```
+POST /auth/refresh
+```
+
+**Authentication:** requires the `relay_refresh` `httpOnly` cookie. Browsers and curl send this automatically when the cookie jar contains a valid entry. You do not pass any request body or `Authorization` header.
+
+## Response
+
+HTTP `200 OK`.
+
+<ResponseField name="accessToken" type="string">
+  A fresh short-lived JWT. Replace the previous access token stored in memory and use this one for all subsequent protected requests. Expires in 15 minutes by default.
+</ResponseField>
+
+## Side effects
+
+The response issues a **new** `relay_refresh` cookie, replacing the previous one. Each refresh token is single-use: attempting to reuse a token that has already been rotated returns `401 Unauthorized`. This limits the impact of a stolen refresh token because any use of the old token immediately signals a potential compromise.
+
+| Attribute  | Value              |
+|------------|--------------------|
+| `HttpOnly` | `true`             |
+| `SameSite` | `Lax`              |
+| `Secure`   | `true` (production)|
+| `Path`     | `/auth`            |
+| Expiry     | 30 days from rotation |
+
+## Example
+
+```bash
+curl -i -X POST https://api.relay.example.com/auth/refresh \
+  --cookie cookies.jar \
+  --cookie-jar cookies.jar
+```
+
+```json
+{
+  "accessToken": "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9..."
+}
+```
+
+The `--cookie-jar` flag tells curl to save the updated `relay_refresh` cookie so the next rotation works correctly. In a browser this happens automatically.
+
+## Error responses
+
+| Status | Condition |
+|--------|-----------|
+| `401 Unauthorized` | The `relay_refresh` cookie is absent, the token signature is invalid, the token has expired, or the token has already been rotated (i.e., it was used more than once). |

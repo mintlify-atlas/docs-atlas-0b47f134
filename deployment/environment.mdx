@@ -1,0 +1,98 @@
+---
+title: "Environment variables reference"
+description: "Configure the backend and frontend environment variables needed to run Relay in development or production, including auth, database, and Cloudinary settings."
+---
+
+Relay is split into two independent processes — a NestJS backend and a Next.js frontend — and each reads its own set of environment variables. The backend reads from a `.env` file (or your host's environment) at startup; the frontend picks up any `NEXT_PUBLIC_` variables at build time. Copy `relay-backend/.env.example` to `relay-backend/.env` and fill in the values below before running either service.
+
+## Backend environment variables
+
+These variables are read by the NestJS backend (`relay-backend`). Create a `relay-backend/.env` file based on `.env.example`.
+
+### Database
+
+<ParamField body="DATABASE_URL" type="string">
+  PostgreSQL connection string in the format `postgresql://user:password@host:5432/dbname`. Leave this **empty** to run Relay in in-memory mode — no database is required for development or demos. When empty, the backend automatically selects `InMemoryChatStrategy` and all messages are lost on restart.
+</ParamField>
+
+<Tip>
+  Omitting `DATABASE_URL` entirely activates `InMemoryChatStrategy`. This is the fastest way to get the app running: no Postgres instance, no migrations, no setup. Data is gone when the server restarts.
+</Tip>
+
+### Server
+
+<ParamField body="PORT" type="number" default="4000">
+  The port the NestJS HTTP and WebSocket server listens on. The frontend's `NEXT_PUBLIC_API_URL` must point to this port.
+</ParamField>
+
+<ParamField body="CORS_ORIGIN" type="string" default="http://localhost:3000" required>
+  The origin the backend accepts cross-origin requests from. Set this to your frontend's public URL in production (e.g. `https://relay.example.com`). Mismatching this value will block all browser requests.
+</ParamField>
+
+### Auth
+
+<ParamField body="JWT_ACCESS_SECRET" type="string" required>
+  Secret used to sign short-lived JWT access tokens. Use a long random string in production — at least 32 bytes of entropy. The default `change-me` value must not be used outside local development.
+</ParamField>
+
+<ParamField body="JWT_REFRESH_SECRET" type="string" required>
+  Secret used to sign long-lived JWT refresh tokens. Must be different from `JWT_ACCESS_SECRET`. Rotating this secret invalidates all active sessions.
+</ParamField>
+
+<ParamField body="JWT_ACCESS_TTL" type="string" default="15m">
+  Expiry duration for access tokens, in [ms](https://github.com/vercel/ms) format (e.g. `15m`, `1h`). Short values reduce the window of exposure if a token is leaked.
+</ParamField>
+
+<ParamField body="JWT_REFRESH_TTL" type="string" default="30d">
+  Expiry duration for refresh tokens, in ms format (e.g. `30d`, `90d`). Refresh tokens are stored hashed in the `Session` table and are invalidated on logout.
+</ParamField>
+
+### Cloudinary (optional)
+
+These three variables are optional until you enable media uploads (milestone M5). Leave them empty to run without file-sharing support.
+
+<ParamField body="CLOUDINARY_CLOUD_NAME" type="string">
+  Your Cloudinary cloud name, found on the Cloudinary dashboard. Required only when media upload is enabled.
+</ParamField>
+
+<ParamField body="CLOUDINARY_API_KEY" type="string">
+  Cloudinary API key. Used by the backend to generate signed upload URLs. The frontend never receives this value.
+</ParamField>
+
+<ParamField body="CLOUDINARY_API_SECRET" type="string">
+  Cloudinary API secret. Keep this out of version control. Used server-side only to sign upload requests.
+</ParamField>
+
+<Warning>
+  Never commit real values for `JWT_ACCESS_SECRET`, `JWT_REFRESH_SECRET`, or any Cloudinary secret to your repository. The `.env.example` file intentionally leaves secrets blank or set to `change-me` as a reminder.
+</Warning>
+
+## Frontend environment variables
+
+The Next.js frontend (`relay-app`) currently has no `NEXT_PUBLIC_` variables defined in `next.config.ts`. If you add them (for example, `NEXT_PUBLIC_API_URL` to point at the backend), they must be prefixed with `NEXT_PUBLIC_` to be exposed to the browser bundle at build time. Variables without this prefix are server-side only and not accessible in client components.
+
+<Info>
+  Next.js bakes `NEXT_PUBLIC_` values into the JavaScript bundle at build time. Changing them requires a full rebuild — restarting the dev server alone is not enough.
+</Info>
+
+## Complete `.env.example`
+
+```bash .env.example
+# --- Database (leave DATABASE_URL empty to run in Temporary/in-memory mode) ---
+DATABASE_URL=
+
+# --- Server ---
+PORT=4000
+CORS_ORIGIN=http://localhost:3000
+
+# --- Auth ---
+JWT_ACCESS_SECRET=change-me
+JWT_REFRESH_SECRET=change-me
+JWT_ACCESS_TTL=15m
+JWT_REFRESH_TTL=30d
+
+# --- Cloudinary (optional until M5) ---
+CLOUDINARY_CLOUD_NAME=
+CLOUDINARY_API_KEY=
+CLOUDINARY_API_SECRET=
+```

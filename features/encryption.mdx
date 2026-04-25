@@ -1,0 +1,117 @@
+---
+title: "End-to-end encryption model"
+description: "Relay uses X25519 ECDH key exchange and AES-256-GCM message encryption via libsodium. The server stores only ciphertext and never sees plaintext messages."
+---
+
+Relay's encryption layer is designed to be auditable and straightforward rather than maximally sophisticated. The scheme uses `libsodium-wrappers` for all cryptographic operations, which runs identically in the browser and in Node.js and covers every primitive the app needs: key generation, key exchange, password hashing, and authenticated encryption. The guiding principle is that the server stores only what it cannot decrypt.
+
+## Key generation on signup
+
+When a user signs up, the browser generates two keypairs before any data reaches the server.
+
+**Ed25519 identity keypair** — used to sign messages and prove authorship. The public key is uploaded as the `identityPubKey` field of the user's `KeyBundle`. The private key never leaves the browser.
+
+**X25519 keypair** — used for Diffie-Hellman key exchange when wrapping conversation keys. The public key is uploaded as `exchangePubKey`. Again, the private key stays local.
+
+Both private keys are serialized, bundled into a single blob, and encrypted with a key derived from the user's password via `argon2id`. The resulting ciphertext is stored in the `wrappedPrivateKeys` field of `KeyBundle`:
+
+```prisma
+model KeyBundle {
+  userId             String   @id
+  identityPubKey     String
+  exchangePubKey     String
+  wrappedPrivateKeys String   // argon2id-wrapped blob; server cannot decrypt
+  createdAt          DateTime @default(now())
+  updatedAt          DateTime @updatedAt
+}
+```
+
+The server stores this blob only so the user can recover their keys on a new device by re-entering their password. The server cannot unwrap it — it never knows the password.
+
+## Per-conversation key
+
+Every conversation has one random AES-256-GCM symmetric key, generated fresh by the conversation creator. That key is never uploaded in plaintext. Instead, the creator computes a wrapped copy for each member using the following procedure:
+
+1. Perform X25519 ECDH between the creator's private exchange key and the recipient's public exchange key to produce a shared secret.
+2. Feed the shared secret through HKDF to derive a 256-bit AES key-wrapping key.
+3. Use AES-KW to wrap the conversation key with the derived wrapping key.
+
+The resulting opaque strings are submitted alongside the conversation creation request. The server persists them verbatim:
+
+```prisma
+model ConversationKey {
+  userId         String
+  conversationId String
+  wrappedKey     String   // opaque to the server
+  createdAt      DateTime @default(now())
+
+  @@id([userId, conversationId])
+}
+```
+
+Each member fetches their row via `GET /chat/conversations/:id/key` and reverses the process locally: ECDH with the creator's public key → HKDF → AES-KW unwrap → raw AES-256-GCM conversation key, cached in IndexedDB for the session.
+
+## Per-message encryption
+
+Every message is encrypted with the conversation key before being sent over the wire.
+
+```
+ciphertext = AES-256-GCM(conversationKey, plaintext, nonce=random12)
+```
+
+The 12-byte nonce is randomly generated for each message and transmitted alongside the ciphertext. The server stores the message as:
+
+```prisma
+model Message {
+  id             String   @id @default(cuid())
+  conversationId String
+  senderId       String
+  ciphertext     String
+  nonce          String
+  createdAt      DateTime @default(now())
+}
+```
+
+The `chat:send` WebSocket event carries exactly this shape:
+
+```ts
+socket.emit("chat:send", {
+  conversationId: "clxyz123",
+  ciphertext: "<base64 AES-256-GCM ciphertext>",
+  nonce: "<base64 12-byte random nonce>",
+});
+```
+
+Recipients decrypt on receipt: fetch their conversation key from IndexedDB, run AES-256-GCM decrypt with the transmitted nonce, and render the plaintext.
+
+## What the server stores vs never sees
+
+| Data | Server stores | Server sees plaintext |
+|------|---------------|-----------------------|
+| Ed25519 public key | Yes (`identityPubKey`) | Yes — it's a public key |
+| X25519 public key | Yes (`exchangePubKey`) | Yes — it's a public key |
+| Private keys | Yes — as an `argon2id`-wrapped blob | Never |
+| Conversation key | Yes — as per-member AES-KW-wrapped blobs | Never |
+| Message ciphertext | Yes | Never |
+| Message nonce | Yes | Yes — nonces are not secret |
+| `senderId`, `createdAt` | Yes | Yes — this is metadata |
+| Media file bytes | No — stored on Cloudinary | Never |
+| Media URL, mime, size | Yes (`MediaAsset`) | Yes — this is metadata |
+
+The comment in `schema.prisma` sums it up: "The server could read every column here and still not read a single message."
+
+## Key rotation on membership change
+
+When a member is removed from a group conversation, the remaining members should rotate the conversation key so the removed member cannot decrypt future messages. The group owner generates a new AES-256-GCM conversation key, wraps it for each remaining member, and posts the new wrapped key map to `POST /chat/conversations/:id/keys`. The gateway broadcasts `group:member-removed` to prompt all clients to flush their cached key and fetch the new one.
+
+## Known limitations
+
+<Warning>
+  Relay does not implement forward secrecy. The conversation key is static for the lifetime of the conversation (until explicitly rotated). If a conversation key is ever compromised, all messages encrypted under it — past and future — become readable. There is no per-message ephemeral key and no ratchet mechanism. This is a deliberate trade-off for simplicity in a study project.
+</Warning>
+
+Two additional limitations to be aware of:
+
+**No multi-device support.** Keys are generated in the browser and stored in IndexedDB. Signing in on a second device regenerates a new keypair, which overwrites the `KeyBundle` on the server and makes all existing conversation keys unrecoverable on the original device.
+
+**Metadata is visible to the server.** The server knows who is in each conversation, when messages are sent, and approximately how large each message is. Only the message content and media bytes are hidden.

@@ -1,0 +1,425 @@
+---
+title: "WebSocket events reference"
+description: "All Socket.io events in Relay: chat messaging, temporary sessions, group membership, and WebRTC call signaling. Includes payload shapes and delivery targets."
+---
+
+Relay's real-time layer is built on Socket.io. Every feature that needs push delivery — chat messages, group membership changes, and WebRTC call signaling — runs through a single persistent Socket.io connection. The server runs the gateway on the same port as the REST API (default `4000`, controlled by the `PORT` environment variable) and accepts connections from any origin with valid credentials.
+
+## Connection setup
+
+Authentication happens at the handshake stage via the `auth` object. Pass your JWT access token when constructing the socket; the gateway validates it immediately and disconnects the client if the token is missing or invalid. On a successful connection, the server automatically joins the socket to a personal room named `user:{userId}`, which is used to deliver notifications that are addressed to a specific user rather than a conversation.
+
+```ts
+import { io } from 'socket.io-client';
+
+const socket = io('http://localhost:4000', {
+  auth: { token: accessToken },
+});
+
+socket.on('connect', () => {
+  console.log('Connected — personal room user:{userId} joined automatically');
+});
+```
+
+<Note>
+  The token can also be passed as a query parameter (`?token=...`) for environments where setting the `auth` object is not possible, but the `auth` object is preferred.
+</Note>
+
+---
+
+## Client → server events
+
+The client emits these events to the server. Each handler returns an acknowledgement object; use Socket.io's acknowledgement callback or `await socket.emitWithAck(...)` to receive it.
+
+<AccordionGroup>
+
+  <Accordion title="chat:join">
+    Join a conversation room. The gateway verifies that the authenticated user is a member of the conversation before adding the socket to the room. Subsequent `message:new` broadcasts for this conversation will be received once joined.
+
+    **Payload**
+
+    ```ts
+    {
+      conversationId: string; // UUID of the conversation to join
+    }
+    ```
+
+    **Acknowledgement**
+
+    ```ts
+    { ok: true }
+    ```
+
+    **Errors**
+
+    Throws a `WsException` with the message `"Not a member of this conversation"` if the user does not belong to the conversation.
+  </Accordion>
+
+  <Accordion title="chat:leave">
+    Leave a conversation room. The socket stops receiving `message:new` broadcasts for this conversation. No membership check is performed — leaving a room you are not in is a no-op.
+
+    **Payload**
+
+    ```ts
+    {
+      conversationId: string;
+    }
+    ```
+
+    **Acknowledgement**
+
+    ```ts
+    { ok: true }
+    ```
+  </Accordion>
+
+  <Accordion title="chat:send">
+    Send an encrypted message to a conversation. The ciphertext and nonce are stored as-is; the server never decrypts them. The saved message is broadcast to all sockets in the conversation room via `message:new`.
+
+    **Payload**
+
+    ```ts
+    {
+      conversationId: string; // UUID of the target conversation
+      ciphertext: string;     // Base64-encoded AES-256-GCM ciphertext
+      nonce: string;          // Base64-encoded 12-byte random nonce
+    }
+    ```
+
+    **Acknowledgement**
+
+    ```ts
+    {
+      ok: true;
+      message: StoredMessage; // The persisted message record returned from the database
+    }
+    ```
+  </Accordion>
+
+  <Accordion title="temp:toggle">
+    Toggle the temporary-chat session for a conversation. When started, the conversation switches to the `InMemoryChatStrategy` — messages are held only in server RAM and are gone on restart. When ended, the session reverts to durable storage. The returned `started` flag indicates the new state after the toggle.
+
+    **Payload**
+
+    ```ts
+    {
+      conversationId: string;
+    }
+    ```
+
+    **Acknowledgement**
+
+    ```ts
+    {
+      ok: true;
+      started: boolean; // true if a temporary session is now active, false if it ended
+      since: string;    // ISO 8601 timestamp of when the current state began
+    }
+    ```
+  </Accordion>
+
+  <Accordion title="call:offer">
+    Initiate a WebRTC call by sending an SDP offer to a recipient. The gateway validates that both the caller and the recipient are members of the conversation, then forwards the offer to the recipient's personal room as a `call:incoming` event. No call state is persisted on the server.
+
+    **Payload**
+
+    ```ts
+    {
+      conversationId: string;             // Conversation in which the call is taking place
+      recipientId: string;                // User ID of the call recipient
+      offer: RTCSessionDescriptionInit;   // SDP offer from the caller's RTCPeerConnection
+      isVideo: boolean;                   // true for video call, false for audio-only
+    }
+    ```
+
+    **Acknowledgement**
+
+    ```ts
+    { ok: true }
+    ```
+
+    **Errors**
+
+    Throws a `WsException` if the caller or recipient is not a member of the conversation.
+  </Accordion>
+
+  <Accordion title="call:answer">
+    Accept an incoming call by sending an SDP answer back to the caller. The gateway forwards the answer to the caller's personal room as a `call:answered` event.
+
+    **Payload**
+
+    ```ts
+    {
+      conversationId: string;            // Conversation in which the call is taking place
+      callerId: string;                  // User ID of the original caller
+      answer: RTCSessionDescriptionInit; // SDP answer from the answerer's RTCPeerConnection
+    }
+    ```
+
+    **Acknowledgement**
+
+    ```ts
+    { ok: true }
+    ```
+  </Accordion>
+
+  <Accordion title="call:ice-candidate">
+    Forward a Trickle ICE candidate to another participant. The gateway validates membership and relays the candidate to the target user's personal room as a `call:ice-candidate` server event. Both the caller and the answerer send candidates to each other using this event.
+
+    **Payload**
+
+    ```ts
+    {
+      conversationId: string;          // Conversation in which the call is taking place
+      targetUserId: string;            // User ID of the candidate recipient
+      candidate: RTCIceCandidateInit;  // ICE candidate from the local RTCPeerConnection
+    }
+    ```
+
+    **Acknowledgement**
+
+    ```ts
+    { ok: true }
+    ```
+  </Accordion>
+
+  <Accordion title="call:reject">
+    Decline an incoming call. The gateway forwards the rejection to the caller's personal room as a `call:rejected` event. No membership check is performed beyond confirming that the user is authenticated.
+
+    **Payload**
+
+    ```ts
+    {
+      conversationId: string; // Conversation in which the call was attempted
+      callerId: string;       // User ID of the caller to notify
+    }
+    ```
+
+    **Acknowledgement**
+
+    ```ts
+    { ok: true }
+    ```
+  </Accordion>
+
+  <Accordion title="call:hangup">
+    End an active call. The gateway looks up all members of the conversation and emits `call:ended` to every member's personal room except the user who hung up.
+
+    **Payload**
+
+    ```ts
+    {
+      conversationId: string; // Conversation whose call is being ended
+    }
+    ```
+
+    **Acknowledgement**
+
+    ```ts
+    { ok: true }
+    ```
+  </Accordion>
+
+</AccordionGroup>
+
+---
+
+## Server → client events
+
+The server emits these events to connected clients. Your client should register listeners for all events it cares about immediately after the socket connects.
+
+<AccordionGroup>
+
+  <Accordion title="message:new">
+    Emitted to every socket in a conversation room when a new message is stored. This is the primary delivery mechanism for chat messages.
+
+    **Delivery target:** all sockets that have joined the conversation room via `chat:join`.
+
+    **Payload**
+
+    ```ts
+    StoredMessage // The full persisted message record, including id, senderId, ciphertext, nonce, and createdAt
+    ```
+  </Accordion>
+
+  <Accordion title="conv:new">
+    Emitted when a new conversation is created that includes the receiving user, or when the user is added to an existing group. Clients should use this event to refresh their conversation list.
+
+    **Delivery target:** the personal room (`user:{userId}`) of each member.
+
+    **Payload**
+
+    ```ts
+    {
+      conversationId: string; // UUID of the new or updated conversation
+    }
+    ```
+  </Accordion>
+
+  <Accordion title="conv:deleted">
+    Emitted to all members of a conversation when it is deleted. Clients should remove the conversation from their local list and navigate away from its view if open.
+
+    **Delivery target:** the personal room (`user:{userId}`) of each former member.
+
+    **Payload**
+
+    ```ts
+    {
+      conversationId: string;
+    }
+    ```
+  </Accordion>
+
+  <Accordion title="temp:started">
+    Emitted to the conversation room when a temporary chat session becomes active. Clients should display an indicator that messages in this session are not durably stored.
+
+    **Delivery target:** all sockets in the conversation room.
+
+    **Payload**
+
+    ```ts
+    {
+      conversationId: string;
+      since: string; // ISO 8601 timestamp when the temporary session started
+    }
+    ```
+  </Accordion>
+
+  <Accordion title="temp:ended">
+    Emitted to the conversation room when a temporary chat session ends and the conversation reverts to durable storage.
+
+    **Delivery target:** all sockets in the conversation room.
+
+    **Payload**
+
+    ```ts
+    {
+      conversationId: string;
+      since: string; // ISO 8601 timestamp when the session ended
+    }
+    ```
+  </Accordion>
+
+  <Accordion title="group:member-added">
+    Emitted to the conversation room when a new member joins a group. Clients should refresh their local member list and, if encryption is active, be aware that a key rotation may follow.
+
+    **Delivery target:** all sockets currently in the conversation room.
+
+    **Payload**
+
+    ```ts
+    {
+      conversationId: string;
+      userId: string; // User ID of the newly added member
+    }
+    ```
+  </Accordion>
+
+  <Accordion title="group:member-removed">
+    Emitted to the conversation room when a member is removed from a group. Clients should refresh their local member list. Because group key rotation occurs on membership change, any cached conversation key should be invalidated.
+
+    **Delivery target:** all sockets currently in the conversation room (excluding the removed user's room, which receives `group:kicked` instead).
+
+    **Payload**
+
+    ```ts
+    {
+      conversationId: string;
+      userId: string; // User ID of the removed member
+    }
+    ```
+  </Accordion>
+
+  <Accordion title="group:kicked">
+    Emitted to the removed user only when they are kicked from a group. The client should remove the conversation from the sidebar and stop listening on its room.
+
+    **Delivery target:** the personal room (`user:{userId}`) of the removed user only.
+
+    **Payload**
+
+    ```ts
+    {
+      conversationId: string;
+    }
+    ```
+  </Accordion>
+
+  <Accordion title="call:incoming">
+    Emitted to the recipient when another user initiates a call. The client should present an incoming call UI and use the `offer` to begin WebRTC negotiation if the user accepts.
+
+    **Delivery target:** the personal room (`user:{recipientId}`) of the call recipient.
+
+    **Payload**
+
+    ```ts
+    {
+      callerId: string;                   // User ID of the caller
+      conversationId: string;
+      offer: RTCSessionDescriptionInit;   // SDP offer to pass to RTCPeerConnection.setRemoteDescription
+      isVideo: boolean;                   // Whether the caller requested video
+    }
+    ```
+  </Accordion>
+
+  <Accordion title="call:answered">
+    Emitted to the original caller when the recipient accepts the call. Pass `answer` to `RTCPeerConnection.setRemoteDescription` to complete the offer/answer exchange.
+
+    **Delivery target:** the personal room (`user:{callerId}`) of the original caller.
+
+    **Payload**
+
+    ```ts
+    {
+      answererId: string;                  // User ID of the user who accepted
+      conversationId: string;
+      answer: RTCSessionDescriptionInit;   // SDP answer from the answerer
+    }
+    ```
+  </Accordion>
+
+  <Accordion title="call:rejected">
+    Emitted to the original caller when the recipient declines the call. The client should dismiss the outgoing call UI.
+
+    **Delivery target:** the personal room (`user:{callerId}`) of the original caller.
+
+    **Payload**
+
+    ```ts
+    {
+      rejecterId: string;     // User ID of the user who rejected
+      conversationId: string;
+    }
+    ```
+  </Accordion>
+
+  <Accordion title="call:ended">
+    Emitted to all other participants in the conversation when one user hangs up. The client should tear down its `RTCPeerConnection` and dismiss the call UI.
+
+    **Delivery target:** the personal room (`user:{memberId}`) of every conversation member except the user who hung up.
+
+    **Payload**
+
+    ```ts
+    {
+      byUserId: string;       // User ID of the participant who ended the call
+      conversationId: string;
+    }
+    ```
+  </Accordion>
+
+  <Accordion title="call:ice-candidate (server → client)">
+    Relayed ICE candidate from the remote participant. Pass `candidate` to `RTCPeerConnection.addIceCandidate` as soon as it arrives. Both sides of the call exchange candidates through this event.
+
+    **Delivery target:** the personal room (`user:{targetUserId}`) specified in the originating `call:ice-candidate` client event.
+
+    **Payload**
+
+    ```ts
+    {
+      fromUserId: string;              // User ID of the participant who sent this candidate
+      candidate: RTCIceCandidateInit;  // ICE candidate to pass to addIceCandidate
+    }
+    ```
+  </Accordion>
+
+</AccordionGroup>

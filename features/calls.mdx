@@ -1,0 +1,142 @@
+---
+title: "WebRTC peer-to-peer calls"
+description: "Relay supports 1:1 audio and video calls via WebRTC. Signaling is relayed through Socket.io; all media flows directly peer-to-peer and never touches the server."
+---
+
+Relay adds voice and video calling on top of its existing Socket.io infrastructure. The server's role is limited to relaying WebRTC signaling messages — session descriptions and ICE candidates — between the two peers. Once the peer connection is established, all media flows directly between browsers over an encrypted WebRTC channel. The server persists no call state; every handler in `ChatGateway` validates membership, forwards the payload to the target user's personal room, and returns immediately.
+
+## Call establishment flow
+
+<Steps>
+  <Step title="Caller sends an offer">
+    The caller creates a `RTCPeerConnection`, sets a local description, and emits `call:offer` with the SDP offer and whether the call includes video.
+
+    ```ts
+    // Caller emits
+    socket.emit("call:offer", {
+      conversationId: "clxyz123",
+      recipientId: "user_bob",
+      offer: peerConnection.localDescription,   // RTCSessionDescriptionInit
+      isVideo: true,
+    });
+    ```
+
+    The server verifies that both the caller and the recipient are members of the given conversation, then forwards the event to the recipient's personal room as `call:incoming`:
+
+    ```ts
+    // Recipient receives
+    socket.on("call:incoming", ({ callerId, conversationId, offer, isVideo }) => {
+      // Show incoming call UI
+    });
+    ```
+  </Step>
+  <Step title="Recipient answers">
+    If the recipient accepts, they create their own `RTCPeerConnection`, set the received offer as the remote description, create an answer, and emit `call:answer`.
+
+    ```ts
+    // Recipient emits
+    socket.emit("call:answer", {
+      conversationId: "clxyz123",
+      callerId: "user_alice",
+      answer: peerConnection.localDescription,  // RTCSessionDescriptionInit
+    });
+    ```
+
+    The server forwards this to the caller's personal room as `call:answered`:
+
+    ```ts
+    // Caller receives
+    socket.on("call:answered", ({ answererId, conversationId, answer }) => {
+      await peerConnection.setRemoteDescription(answer);
+    });
+    ```
+
+    If the recipient declines, they emit `call:reject` instead. The caller receives `call:rejected`:
+
+    ```ts
+    socket.emit("call:reject", { conversationId: "clxyz123", callerId: "user_alice" });
+    // Caller receives: { rejecterId, conversationId }
+    ```
+  </Step>
+  <Step title="ICE candidates are exchanged">
+    Both peers trickle ICE candidates to each other through the server as they are discovered.
+
+    ```ts
+    // Either peer emits
+    socket.emit("call:ice-candidate", {
+      conversationId: "clxyz123",
+      targetUserId: "user_bob",
+      candidate: iceEvent.candidate,   // RTCIceCandidateInit
+    });
+
+    // Target receives
+    socket.on("call:ice-candidate", ({ fromUserId, candidate }) => {
+      await peerConnection.addIceCandidate(candidate);
+    });
+    ```
+
+    The server verifies membership before forwarding each candidate. Candidate exchange continues until the ICE agent has enough material to attempt connections.
+  </Step>
+  <Step title="Peer-to-peer connection is established">
+    Once ICE negotiation succeeds, the `RTCPeerConnection` transitions to the `connected` state and media flows directly between the two browsers. The Socket.io connection is no longer involved in the media path.
+
+    The `CallOverlay` component attaches the remote stream to a `<video>` element for video calls or to a hidden `<audio>` element for voice-only calls, ensuring audio is played even when no video element is visible:
+
+    ```ts
+    // From call-overlay.tsx
+    if (active?.isVideo && remoteVideoRef.current) {
+      remoteVideoRef.current.srcObject = remoteStream;
+    }
+    if (!active?.isVideo && remoteAudioRef.current) {
+      remoteAudioRef.current.srcObject = remoteStream;
+    }
+    ```
+  </Step>
+</Steps>
+
+## Ending a call
+
+Either party can hang up at any time by emitting `call:hangup`. The server iterates over all other members of the conversation and emits `call:ended` to each of their personal rooms.
+
+```ts
+// Either peer emits
+socket.emit("call:hangup", { conversationId: "clxyz123" });
+
+// All other members receive
+socket.on("call:ended", ({ byUserId, conversationId }) => {
+  // Close RTCPeerConnection, clean up streams
+});
+```
+
+## Signaling event reference
+
+| Event emitted by client | Event received by peer | Description |
+|------------------------|------------------------|-------------|
+| `call:offer` | `call:incoming` | Initiate a call |
+| `call:answer` | `call:answered` | Accept an incoming call |
+| `call:reject` | `call:rejected` | Decline an incoming call |
+| `call:ice-candidate` | `call:ice-candidate` | Trickle an ICE candidate |
+| `call:hangup` | `call:ended` | End an active call |
+
+All events are relay-only. The gateway source comments make this explicit: "validate membership then forward to the target user's personal room. No call state is persisted on the server."
+
+## STUN configuration
+
+Relay uses Google's public STUN server to help peers discover their reflexive (NAT-translated) addresses. No TURN server is deployed.
+
+```ts
+const peerConnection = new RTCPeerConnection({
+  iceServers: [{ urls: "stun:stun.l.google.com:19302" }],
+});
+```
+
+<Note>
+  Without a TURN server, calls will fail when both peers are behind a symmetric NAT — a configuration common on some corporate and carrier-grade networks. In that scenario ICE will gather candidates but no successful candidate pair will be found, and the `RTCPeerConnection` will never reach the `connected` state. Additionally, calls are limited to two participants; group calling is not implemented.
+</Note>
+
+## Limitations
+
+- **1:1 only.** The signaling events target a single `recipientId`. Multi-party calls require a mesh or SFU architecture that is outside the scope of this project.
+- **No TURN server.** Symmetric NAT traversal is not guaranteed. See the note above.
+- **No call recording or transcription.** Media never touches the server, so server-side processing is not possible.
+- **No persistence.** Missed calls leave no record; there is no call history in the data model.

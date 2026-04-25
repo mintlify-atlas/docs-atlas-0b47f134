@@ -1,0 +1,104 @@
+---
+title: "POST /auth/login — authenticate a user"
+description: "Exchange a registered email address and password for a JWT access token and a rotating refresh cookie that keeps the session alive across browser restarts."
+---
+
+The login endpoint verifies an existing account's credentials and, on success, issues a fresh pair of tokens. The access token is returned in the response body for your application to store in memory. The refresh token is delivered as an `httpOnly` cookie so that it is never accessible to JavaScript and cannot be stolen through XSS.
+
+## Endpoint
+
+```
+POST /auth/login
+```
+
+**Authentication:** none required.
+
+## Request body
+
+<ParamField body="email" type="string" required>
+  The email address used when the account was created.
+</ParamField>
+
+<ParamField body="password" type="string" required>
+  The account password. Must be at least 8 characters.
+</ParamField>
+
+## Response
+
+HTTP `200 OK`.
+
+<ResponseField name="user" type="object">
+  The authenticated user's public profile.
+
+  <Expandable title="user fields">
+    <ResponseField name="user.id" type="string">
+      Unique identifier for the user (UUID).
+    </ResponseField>
+
+    <ResponseField name="user.email" type="string">
+      The user's registered email address.
+    </ResponseField>
+
+    <ResponseField name="user.displayName" type="string">
+      The name displayed to other users in conversations.
+    </ResponseField>
+
+    <ResponseField name="user.avatarUrl" type="string | null">
+      URL of the user's avatar image. `null` if no avatar has been uploaded.
+    </ResponseField>
+
+    <ResponseField name="user.createdAt" type="string">
+      ISO 8601 timestamp of when the account was created.
+    </ResponseField>
+  </Expandable>
+</ResponseField>
+
+<ResponseField name="accessToken" type="string">
+  A short-lived JWT used to authenticate subsequent API requests. Pass this value in the `Authorization: Bearer <token>` header. Expires in 15 minutes by default.
+</ResponseField>
+
+## Side effects
+
+The response sets a `relay_refresh` cookie with the following attributes:
+
+| Attribute  | Value              |
+|------------|--------------------|
+| `HttpOnly` | `true`             |
+| `SameSite` | `Lax`              |
+| `Secure`   | `true` (production)|
+| `Path`     | `/auth`            |
+| Expiry     | 30 days by default |
+
+The cookie is scoped to `/auth` so the browser only sends it to the token-management endpoints (`/auth/refresh`, `/auth/logout`). Store the access token in memory and attach it to every protected request yourself.
+
+## Example
+
+```bash
+curl -i -X POST https://api.relay.example.com/auth/login \
+  -H "Content-Type: application/json" \
+  -c cookies.jar \
+  -d '{
+    "email": "ada@example.com",
+    "password": "correct-horse-battery"
+  }'
+```
+
+```json
+{
+  "user": {
+    "id": "01926b3e-8f2a-7000-b1c4-3f9d2e1a0c55",
+    "email": "ada@example.com",
+    "displayName": "Ada Lovelace",
+    "avatarUrl": null,
+    "createdAt": "2026-04-25T10:00:00.000Z"
+  },
+  "accessToken": "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9..."
+}
+```
+
+## Error responses
+
+| Status | Condition |
+|--------|-----------|
+| `400 Bad Request` | One or more fields failed validation (missing, wrong type, or too short). |
+| `401 Unauthorized` | No account exists for the given email, or the password is incorrect. The error message is intentionally generic (`"Invalid credentials"`) to prevent account enumeration. |

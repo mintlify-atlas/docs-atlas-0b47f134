@@ -1,0 +1,169 @@
+---
+title: "Cryptographic key bundle endpoints"
+description: "Upload Ed25519 and X25519 public keys for encrypted messaging. Retrieve your full bundle for key recovery, or another user's public bundle to perform ECDH."
+---
+
+Relay's encryption model requires each user to publish a pair of public keys before they can participate in encrypted conversations. The **identity key** (`identityPubKey`) is a long-lived Ed25519 key that identifies the user. The **exchange key** (`exchangePubKey`) is an X25519 key used for Elliptic-Curve Diffie-Hellman (ECDH) to derive a shared conversation secret. Together these two keys form a key bundle. The server stores key bundles as an opaque pass-through — it never sees the corresponding private keys.
+
+To support key recovery (e.g. logging in from a new device), the client encrypts its private keys with a password-derived key and uploads the resulting blob as `wrappedPrivateKeys`. The server stores this blob verbatim and returns it only to the key's owner.
+
+<Note>
+  `wrappedPrivateKeys` is an encrypted blob derived from the user's password via Argon2id + NaCl secretbox. The server stores it as opaque bytes and cannot decrypt it. If the user forgets their password, this blob cannot be recovered.
+</Note>
+
+---
+
+## PUT /users/me/keys
+
+Upload or replace your key bundle. This is an upsert — calling it again with updated keys replaces the previous bundle. You should call this endpoint once after registering and again any time you rotate your keys.
+
+**Method:** `PUT`  
+**Path:** `/users/me/keys`  
+**Auth:** Bearer token required
+
+### Request body
+
+<ParamField body="identityPubKey" type="string" required>
+  Base64-encoded Ed25519 identity public key. Maximum 512 characters.
+</ParamField>
+
+<ParamField body="exchangePubKey" type="string" required>
+  Base64-encoded X25519 exchange public key used for ECDH. Maximum 512 characters.
+</ParamField>
+
+<ParamField body="wrappedPrivateKeys" type="string" required>
+  Encrypted blob containing the user's private keys, sealed with a password-derived key. Opaque to the server. Maximum 4096 characters.
+</ParamField>
+
+### Response
+
+<ResponseField name="userId" type="string" required>
+  UUID of the user who owns this bundle.
+</ResponseField>
+
+<ResponseField name="identityPubKey" type="string" required>
+  The stored identity public key, echoed back.
+</ResponseField>
+
+<ResponseField name="exchangePubKey" type="string" required>
+  The stored exchange public key, echoed back.
+</ResponseField>
+
+<ResponseField name="wrappedPrivateKeys" type="string" required>
+  The stored encrypted private key blob, echoed back.
+</ResponseField>
+
+### Example
+
+```bash
+curl -X PUT https://api.relay.example/users/me/keys \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "identityPubKey": "base64-encoded-identity-pub-key==",
+    "exchangePubKey": "base64-encoded-exchange-pub-key==",
+    "wrappedPrivateKeys": "base64-encoded-encrypted-private-key-blob=="
+  }'
+```
+
+```json
+{
+  "userId": "a1b2c3d4-0000-0000-0000-000000000001",
+  "identityPubKey": "base64-encoded-identity-pub-key==",
+  "exchangePubKey": "base64-encoded-exchange-pub-key==",
+  "wrappedPrivateKeys": "base64-encoded-encrypted-private-key-blob=="
+}
+```
+
+---
+
+## GET /users/me/keys
+
+Fetch your own full key bundle, including `wrappedPrivateKeys`. Use this endpoint when signing in on a new device to retrieve your encrypted private keys for local decryption and key recovery.
+
+**Method:** `GET`  
+**Path:** `/users/me/keys`  
+**Auth:** Bearer token required
+
+### Response
+
+<ResponseField name="userId" type="string" required>
+  UUID of the authenticated user.
+</ResponseField>
+
+<ResponseField name="identityPubKey" type="string" required>
+  Base64-encoded Ed25519 identity public key.
+</ResponseField>
+
+<ResponseField name="exchangePubKey" type="string" required>
+  Base64-encoded X25519 exchange public key.
+</ResponseField>
+
+<ResponseField name="wrappedPrivateKeys" type="string" required>
+  Encrypted private key blob. Decrypt locally using the password-derived key — the server cannot do this for you.
+</ResponseField>
+
+### Example
+
+```bash
+curl https://api.relay.example/users/me/keys \
+  -H "Authorization: Bearer $TOKEN"
+```
+
+```json
+{
+  "userId": "a1b2c3d4-0000-0000-0000-000000000001",
+  "identityPubKey": "base64-encoded-identity-pub-key==",
+  "exchangePubKey": "base64-encoded-exchange-pub-key==",
+  "wrappedPrivateKeys": "base64-encoded-encrypted-private-key-blob=="
+}
+```
+
+---
+
+## GET /users/:id/keys
+
+Fetch another user's **public** key bundle. This returns only the identity and exchange public keys — `wrappedPrivateKeys` is never included. Use this endpoint to retrieve a peer's exchange key before performing ECDH to derive a shared conversation secret.
+
+**Method:** `GET`  
+**Path:** `/users/:id/keys`  
+**Auth:** Bearer token required
+
+### Path parameters
+
+<ParamField path="id" type="string" required>
+  UUID of the user whose public keys you want to retrieve.
+</ParamField>
+
+### Response
+
+<ResponseField name="userId" type="string" required>
+  UUID of the user who owns the bundle.
+</ResponseField>
+
+<ResponseField name="identityPubKey" type="string" required>
+  Base64-encoded Ed25519 identity public key.
+</ResponseField>
+
+<ResponseField name="exchangePubKey" type="string" required>
+  Base64-encoded X25519 exchange public key. Use this with your own private exchange key to perform ECDH and derive a shared secret.
+</ResponseField>
+
+### Example
+
+```bash
+curl https://api.relay.example/users/b2c3d4e5-0000-0000-0000-000000000002/keys \
+  -H "Authorization: Bearer $TOKEN"
+```
+
+```json
+{
+  "userId": "b2c3d4e5-0000-0000-0000-000000000002",
+  "identityPubKey": "base64-encoded-identity-pub-key==",
+  "exchangePubKey": "base64-encoded-exchange-pub-key=="
+}
+```
+
+<Note>
+  The `wrappedPrivateKeys` field is deliberately omitted from this response. Private key material is only returned by `GET /users/me/keys` and only to the key's owner.
+</Note>

@@ -1,0 +1,101 @@
+---
+title: "Running Relay locally and in production"
+description: "Start the NestJS backend and Next.js frontend in development or production mode. Run without a database for quick demos using the built-in in-memory strategy."
+---
+
+Relay consists of two independent processes that you run in separate terminals: the NestJS backend (`relay-backend`) and the Next.js frontend (`relay-app`). There is no monorepo tooling — each directory has its own `package.json` and `node_modules`. Before starting either process, copy `.env.example` to `.env` in `relay-backend` and set `CORS_ORIGIN` to the frontend's address.
+
+<Tabs>
+  <Tab title="Development">
+    Development mode runs both processes with hot reload. The backend uses `nest start --watch` to recompile on file changes; the frontend uses the Next.js dev server with Fast Refresh.
+
+    Start each in its own terminal:
+
+    <CodeGroup>
+    ```bash Backend
+    cd relay-backend
+    npm install
+    npm run start:dev
+    ```
+
+    ```bash Frontend
+    cd relay-app
+    npm install
+    npm run dev
+    ```
+    </CodeGroup>
+
+    The backend listens on `http://localhost:4000` by default (controlled by `PORT` in `.env`). The frontend dev server starts on `http://localhost:3000`.
+
+    <Tip>
+      You do not need a database to run in development. Leave `DATABASE_URL` empty in `relay-backend/.env` and the backend will automatically use `InMemoryChatStrategy`. All messages are stored in memory and lost on restart — enough to test the full UI flow without any infrastructure.
+    </Tip>
+  </Tab>
+  <Tab title="Production">
+    Production mode compiles both processes to optimized output. Build the backend first (TypeScript → JavaScript in `dist/`), then build the frontend (static + server bundle in `.next/`).
+
+    <CodeGroup>
+    ```bash Backend
+    cd relay-backend
+    npm install
+    npm run build
+    npm run start:prod
+    ```
+
+    ```bash Frontend
+    cd relay-app
+    npm install
+    npm run build
+    npm run start
+    ```
+    </CodeGroup>
+
+    `npm run start:prod` runs `node dist/main` directly — no TypeScript compiler overhead. The frontend's `npm run start` serves the `.next` build via the Next.js production server.
+
+    Ensure `DATABASE_URL`, `JWT_ACCESS_SECRET`, `JWT_REFRESH_SECRET`, and `CORS_ORIGIN` are all set to production values before running the production build. See the [environment variables reference](/deployment/environment) for details.
+  </Tab>
+</Tabs>
+
+## Running without a database
+
+Leave `DATABASE_URL` empty (or unset) in `relay-backend/.env`. The backend detects the missing value on startup and switches to `InMemoryChatStrategy`, which stores conversations and messages in plain `Map`s.
+
+No migration, no Postgres instance, no Prisma client connection. Everything else — authentication, WebSocket messaging, E2EE key bundles — works exactly as in the full database mode, except data does not survive a restart.
+
+This is the recommended path for quick demos, grader review, and offline development.
+
+## Available scripts
+
+### Backend (`relay-backend`)
+
+| Script | Command | Description |
+|---|---|---|
+| `start:dev` | `nest start --watch` | Development server with file-watching and hot reload |
+| `start:prod` | `node dist/main` | Production server (requires `npm run build` first) |
+| `build` | `nest build` | Compiles TypeScript to `dist/` |
+| `start:debug` | `nest start --debug --watch` | Development server with Node.js inspector attached |
+| `test` | `jest` | Runs unit tests |
+| `test:e2e` | `jest --config ./test/jest-e2e.json` | Runs end-to-end tests |
+
+### Frontend (`relay-app`)
+
+| Script | Command | Description |
+|---|---|---|
+| `dev` | `next dev` | Development server with Fast Refresh |
+| `build` | `next build` | Produces optimized production bundle in `.next/` |
+| `start` | `next start` | Serves the `.next` production build |
+| `lint` | `eslint` | Lints the source |
+
+## Known limitations
+
+<Note>
+  **No horizontal scaling without Redis.** The backend's pub/sub (typing indicators, presence, message broadcasting) is implemented in-process using RxJS subjects. Running multiple backend instances means Socket.io events published on one instance are not forwarded to clients connected to other instances. Adding Redis as a Socket.io adapter would fix this, but Redis is intentionally omitted from v1 to keep the stack simple.
+</Note>
+
+<Note>
+  **WebRTC calls may fail behind symmetric NAT.** The 1:1 call feature uses Google's public STUN server for ICE candidate gathering but includes no TURN server. Peers behind symmetric NAT (common on corporate networks and some mobile carriers) cannot establish a direct P2P connection and calls will fail. This is a known constraint of the "no TURN server" decision documented in `plan.md`.
+</Note>
+
+<Note>
+  **No multi-device support.** Relay ties one set of cryptographic keys to one browser. If you log in from a second device or browser, the client generates a brand-new Ed25519/X25519 keypair and uploads it, replacing the previous `KeyBundle`. All previous conversation history becomes unreadable because the old private keys are gone. This is a deliberate simplification — full multi-device E2EE (as in Signal) requires a more complex key distribution protocol.
+</Note>

@@ -1,0 +1,142 @@
+---
+title: "Encrypted media uploads and sharing"
+description: "Files are AES-encrypted in the browser and uploaded to Cloudinary as opaque ciphertext. The decryption key travels inside an end-to-end encrypted chat message."
+---
+
+Relay never proxies media through its own server. Instead, the client encrypts a file locally, uploads the resulting ciphertext blob directly to Cloudinary using a server-issued signed URL, and then shares the Cloudinary URL along with the file's decryption key inside a normal encrypted chat message. The server sees only the URL and plaintext metadata — it has no access to the file bytes or the key used to encrypt them.
+
+## Upload flow
+
+<Steps>
+  <Step title="Generate a per-file AES key">
+    Before touching the file, the browser generates a fresh random AES-256-GCM key dedicated to this upload. This key exists only in memory until it is embedded in the chat message.
+
+    ```ts
+    const fileKey = await crypto.subtle.generateKey(
+      { name: "AES-GCM", length: 256 },
+      true,           // extractable so it can be serialized into the message
+      ["encrypt", "decrypt"],
+    );
+    ```
+  </Step>
+  <Step title="Encrypt the file client-side">
+    The raw file bytes are read into an `ArrayBuffer` and encrypted with the per-file key. A random 12-byte nonce is generated for this operation.
+
+    ```ts
+    const nonce = crypto.getRandomValues(new Uint8Array(12));
+    const fileBytes = await file.arrayBuffer();
+
+    const ciphertext = await crypto.subtle.encrypt(
+      { name: "AES-GCM", iv: nonce },
+      fileKey,
+      fileBytes,
+    );
+    // ciphertext is an ArrayBuffer — opaque binary, safe to upload anywhere
+    ```
+
+    Cloudinary receives only this ciphertext blob. It cannot reconstruct the original file.
+  </Step>
+  <Step title="Upload ciphertext to Cloudinary via a signed URL">
+    The client requests a signed upload URL from the backend. The backend uses its Cloudinary API secret to generate a short-lived signature without ever seeing the file content.
+
+    ```ts
+    // 1. Fetch a signed URL from the server
+    const { signature, timestamp, uploadPreset } = await fetch(
+      "/media/signed-upload",
+      { headers: { Authorization: `Bearer ${accessToken}` } },
+    ).then((r) => r.json());
+
+    // 2. POST the encrypted blob directly to Cloudinary
+    const form = new FormData();
+    form.append("file", new Blob([ciphertext], { type: "application/octet-stream" }));
+    form.append("signature", signature);
+    form.append("timestamp", String(timestamp));
+    form.append("upload_preset", uploadPreset);
+
+    const { secure_url: cloudinaryUrl } = await fetch(
+      "https://api.cloudinary.com/v1_1/<cloud>/raw/upload",
+      { method: "POST", body: form },
+    ).then((r) => r.json());
+    ```
+  </Step>
+  <Step title="Send a chat message with the file key">
+    The sender constructs a plaintext payload containing the Cloudinary URL, the exportable file key, and file metadata. This payload is then encrypted with the conversation key and sent via the normal `chat:send` event — so the file key itself travels end-to-end encrypted inside the message.
+
+    ```ts
+    const exportedKey = await crypto.subtle.exportKey("raw", fileKey);
+
+    const plaintext = JSON.stringify({
+      cloudinaryUrl,
+      fileKey: btoa(String.fromCharCode(...new Uint8Array(exportedKey))),
+      nonce: btoa(String.fromCharCode(...nonce)),
+      mime: file.type,
+      size: file.size,
+    });
+
+    // Encrypt plaintext with the conversation key, then emit chat:send as usual
+    socket.emit("chat:send", {
+      conversationId,
+      ciphertext: encryptWithConversationKey(plaintext),
+      nonce: messageNonce,
+    });
+    ```
+
+    The server stores the resulting row in `Message` (ciphertext + nonce) and a linked `MediaAsset` row with only the URL and plaintext metadata:
+
+    ```prisma
+    model MediaAsset {
+      id            String   @id @default(cuid())
+      messageId     String
+      cloudinaryUrl String
+      mime          String
+      size          Int
+      createdAt     DateTime @default(now())
+    }
+    ```
+  </Step>
+</Steps>
+
+## Recipient flow
+
+When a recipient receives a `message:new` event for a media message:
+
+1. Decrypt the message ciphertext with the conversation key to recover the JSON payload.
+2. Parse `cloudinaryUrl`, `fileKey`, `nonce`, `mime`, and `size` from the payload.
+3. Fetch the ciphertext blob from Cloudinary: `fetch(cloudinaryUrl)`.
+4. Import `fileKey` as a raw AES-256-GCM `CryptoKey` and decrypt the blob using the stored `nonce`.
+5. Create an object URL from the resulting `ArrayBuffer` and render the file inline.
+
+```ts
+const { cloudinaryUrl, fileKey: exportedKey, nonce, mime } = JSON.parse(plaintext);
+
+const key = await crypto.subtle.importKey(
+  "raw",
+  Uint8Array.from(atob(exportedKey), (c) => c.charCodeAt(0)),
+  { name: "AES-GCM" },
+  false,
+  ["decrypt"],
+);
+
+const ciphertextBlob = await fetch(cloudinaryUrl).then((r) => r.arrayBuffer());
+
+const decrypted = await crypto.subtle.decrypt(
+  { name: "AES-GCM", iv: Uint8Array.from(atob(nonce), (c) => c.charCodeAt(0)) },
+  key,
+  ciphertextBlob,
+);
+
+const objectUrl = URL.createObjectURL(new Blob([decrypted], { type: mime }));
+```
+
+## What each party stores
+
+| Party | Stores | Does not store |
+|-------|--------|---------------|
+| Cloudinary | Encrypted ciphertext blob | Plaintext file bytes, file key, nonce |
+| Relay server | `cloudinaryUrl`, `mime`, `size` in `MediaAsset` | File bytes, file key, plaintext content |
+| Relay server | Encrypted message row containing the file key | The file key in plaintext |
+| Client (sender) | Conversation key in IndexedDB | Per-file key after send completes |
+
+<Note>
+  The file encryption key travels inside the chat message, which is itself encrypted with the conversation key. A party who can decrypt the conversation can also decrypt any media shared within it. The file key is not separately protected beyond the conversation's end-to-end encryption.
+</Note>

@@ -1,0 +1,43 @@
+---
+title: "POST /auth/logout — end a session"
+description: "Invalidate the current session by revoking the relay_refresh token in the database and clearing the relay_refresh cookie, preventing any further token rotation."
+---
+
+Logging out revokes the server-side session associated with the current `relay_refresh` cookie. Once revoked, the refresh token can no longer be exchanged for a new access token and the cookie is cleared from the browser. Call this endpoint whenever the user explicitly signs out of Relay.
+
+## Endpoint
+
+```
+POST /auth/logout
+```
+
+**Authentication:** requires the `relay_refresh` `httpOnly` cookie. No `Authorization` header or request body is needed.
+
+## Response
+
+HTTP `204 No Content` — the response body is empty.
+
+## Side effects
+
+- The `relay_refresh` cookie is cleared (set to an empty value with an immediate expiry).
+- The refresh token's session record is deleted from the database, so even if the old cookie value were recovered it could not be used again.
+
+<Note>
+  The JWT access token is **not** revoked. Because access tokens are stateless, they remain valid until they naturally expire (15 minutes by default). Design your client to discard the access token from memory immediately on logout to prevent accidental use after the session ends.
+</Note>
+
+## Example
+
+```bash
+curl -i -X POST https://api.relay.example.com/auth/logout \
+  --cookie cookies.jar \
+  --cookie-jar cookies.jar
+```
+
+The server responds with `204 No Content` and no body. The `relay_refresh` cookie in `cookies.jar` will be cleared by the `Set-Cookie` header in the response.
+
+## Error responses
+
+| Status | Condition |
+|--------|-----------|
+| `401 Unauthorized` | The `relay_refresh` cookie is present but the token is malformed. If the cookie is simply absent the server still returns `204` — logout is treated as a no-op for unauthenticated requests. |

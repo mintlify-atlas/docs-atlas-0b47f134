@@ -1,0 +1,325 @@
+---
+title: "Conversation management endpoints"
+description: "Create, list, and delete direct and group conversations, and manage per-member wrapped encryption keys for end-to-end encrypted messaging."
+---
+
+Conversations are the top-level container for Relay messages. There are two types: `DIRECT` (exactly two participants) and `GROUP` (named conversations with up to fifty additional members plus the owner). Every conversation has a symmetric AES-256-GCM key that is generated client-side. The server never sees the raw key — instead it stores one **wrapped** copy per member, where each copy is encrypted to that member's X25519 exchange key. Clients retrieve their wrapped copy with `GET /chat/conversations/:id/key`, decrypt it locally, and use the resulting key to encrypt and decrypt messages.
+
+All endpoints in this section require a Bearer token in the `Authorization` header.
+
+---
+
+## POST /chat/conversations
+
+Create a new direct or group conversation. For direct conversations the server applies a find-or-create dedup — if a direct conversation between you and the specified member already exists, it is returned rather than creating a duplicate.
+
+**Method:** `POST`  
+**Path:** `/chat/conversations`  
+**Auth:** Bearer token required
+
+### Request body
+
+<ParamField body="type" type="string" required>
+  `"DIRECT"` or `"GROUP"`. Direct conversations require exactly one entry in `memberIds` (the other participant); the caller is added automatically.
+</ParamField>
+
+<ParamField body="memberIds" type="string[]" required>
+  Array of user UUIDs to include. For `DIRECT`, supply exactly one other user's ID. For `GROUP`, supply one to forty-nine other user IDs (you are always added as owner).
+</ParamField>
+
+<ParamField body="name" type="string">
+  Display name for the conversation. Required for `GROUP`, ignored for `DIRECT`. Maximum 60 characters.
+</ParamField>
+
+<ParamField body="temporary" type="boolean">
+  If `true`, the conversation is a temporary (ephemeral) session. Messages are deleted from the server when the session ends. Defaults to `false`.
+</ParamField>
+
+<ParamField body="wrappedKeys" type="object">
+  A map of `userId → wrappedKey` containing one AES-256-GCM conversation key per member, each wrapped with that member's X25519 public key. Providing this at creation time means members can decrypt messages immediately. You can also upsert keys later via `POST /chat/conversations/:id/keys`.
+</ParamField>
+
+### Response
+
+Returns an `EnrichedConversation` object.
+
+<ResponseField name="id" type="string" required>
+  UUID of the conversation.
+</ResponseField>
+
+<ResponseField name="type" type="string" required>
+  `"DIRECT"` or `"GROUP"`.
+</ResponseField>
+
+<ResponseField name="name" type="string | null" required>
+  Conversation name. Always `null` for direct conversations.
+</ResponseField>
+
+<ResponseField name="memberIds" type="string[]" required>
+  Ordered array of member user UUIDs.
+</ResponseField>
+
+<ResponseField name="memberNames" type="object" required>
+  Map of `userId → displayName` for every member.
+</ResponseField>
+
+<ResponseField name="memberEmails" type="object" required>
+  Map of `userId → email` for every member. Used client-side as a stable avatar seed.
+</ResponseField>
+
+<ResponseField name="ownerId" type="string | null" required>
+  UUID of the group owner, or `null` for direct conversations.
+</ResponseField>
+
+<ResponseField name="temporary" type="boolean" required>
+  Whether this is an ephemeral conversation.
+</ResponseField>
+
+<ResponseField name="tempSessionSince" type="string | null" required>
+  ISO 8601 timestamp of when the current temporary session started, or `null` if no session is active.
+</ResponseField>
+
+<ResponseField name="createdAt" type="string" required>
+  ISO 8601 timestamp of when the conversation was created.
+</ResponseField>
+
+<ResponseField name="lastMessage" type="object | null">
+  The most recent `StoredMessage` in the conversation, or `null` if no messages have been sent yet. See [Message history and sending](/api/chat/messages) for the `StoredMessage` shape.
+</ResponseField>
+
+### Examples
+
+<Tabs>
+  <Tab title="Direct conversation">
+    ```bash
+    curl -X POST https://api.relay.example/chat/conversations \
+      -H "Authorization: Bearer $TOKEN" \
+      -H "Content-Type: application/json" \
+      -d '{
+        "type": "DIRECT",
+        "memberIds": ["b2c3d4e5-0000-0000-0000-000000000002"],
+        "wrappedKeys": {
+          "a1b2c3d4-0000-0000-0000-000000000001": "wrapped-key-for-alice==",
+          "b2c3d4e5-0000-0000-0000-000000000002": "wrapped-key-for-bob=="
+        }
+      }'
+    ```
+
+    ```json
+    {
+      "id": "conv-0000-0000-0000-000000000001",
+      "type": "DIRECT",
+      "name": null,
+      "memberIds": [
+        "a1b2c3d4-0000-0000-0000-000000000001",
+        "b2c3d4e5-0000-0000-0000-000000000002"
+      ],
+      "memberNames": {
+        "a1b2c3d4-0000-0000-0000-000000000001": "Alice",
+        "b2c3d4e5-0000-0000-0000-000000000002": "Bob"
+      },
+      "memberEmails": {
+        "a1b2c3d4-0000-0000-0000-000000000001": "alice@example.com",
+        "b2c3d4e5-0000-0000-0000-000000000002": "bob@example.com"
+      },
+      "ownerId": null,
+      "temporary": false,
+      "tempSessionSince": null,
+      "createdAt": "2024-03-01T12:00:00.000Z",
+      "lastMessage": null
+    }
+    ```
+  </Tab>
+  <Tab title="Group conversation">
+    ```bash
+    curl -X POST https://api.relay.example/chat/conversations \
+      -H "Authorization: Bearer $TOKEN" \
+      -H "Content-Type: application/json" \
+      -d '{
+        "type": "GROUP",
+        "name": "Engineering",
+        "memberIds": [
+          "b2c3d4e5-0000-0000-0000-000000000002",
+          "c3d4e5f6-0000-0000-0000-000000000003"
+        ],
+        "wrappedKeys": {
+          "a1b2c3d4-0000-0000-0000-000000000001": "wrapped-key-for-alice==",
+          "b2c3d4e5-0000-0000-0000-000000000002": "wrapped-key-for-bob==",
+          "c3d4e5f6-0000-0000-0000-000000000003": "wrapped-key-for-carol=="
+        }
+      }'
+    ```
+
+    ```json
+    {
+      "id": "conv-0000-0000-0000-000000000002",
+      "type": "GROUP",
+      "name": "Engineering",
+      "memberIds": [
+        "a1b2c3d4-0000-0000-0000-000000000001",
+        "b2c3d4e5-0000-0000-0000-000000000002",
+        "c3d4e5f6-0000-0000-0000-000000000003"
+      ],
+      "memberNames": {
+        "a1b2c3d4-0000-0000-0000-000000000001": "Alice",
+        "b2c3d4e5-0000-0000-0000-000000000002": "Bob",
+        "c3d4e5f6-0000-0000-0000-000000000003": "Carol"
+      },
+      "memberEmails": {
+        "a1b2c3d4-0000-0000-0000-000000000001": "alice@example.com",
+        "b2c3d4e5-0000-0000-0000-000000000002": "bob@example.com",
+        "c3d4e5f6-0000-0000-0000-000000000003": "carol@example.com"
+      },
+      "ownerId": "a1b2c3d4-0000-0000-0000-000000000001",
+      "temporary": false,
+      "tempSessionSince": null,
+      "createdAt": "2024-03-01T12:05:00.000Z",
+      "lastMessage": null
+    }
+    ```
+  </Tab>
+</Tabs>
+
+---
+
+## GET /chat/conversations
+
+List all conversations the authenticated user is a member of, each enriched with member display names and emails. Conversations are returned in no guaranteed order — sort client-side by `lastMessage.createdAt` or `createdAt` as needed.
+
+**Method:** `GET`  
+**Path:** `/chat/conversations`  
+**Auth:** Bearer token required
+
+### Response
+
+Returns an array of `EnrichedConversation` objects. See the response fields defined under `POST /chat/conversations` above for the full shape.
+
+### Example
+
+```bash
+curl https://api.relay.example/chat/conversations \
+  -H "Authorization: Bearer $TOKEN"
+```
+
+```json
+[
+  {
+    "id": "conv-0000-0000-0000-000000000001",
+    "type": "DIRECT",
+    "name": null,
+    "memberIds": ["a1b2c3d4-...", "b2c3d4e5-..."],
+    "memberNames": { "a1b2c3d4-...": "Alice", "b2c3d4e5-...": "Bob" },
+    "memberEmails": { "a1b2c3d4-...": "alice@example.com", "b2c3d4e5-...": "bob@example.com" },
+    "ownerId": null,
+    "temporary": false,
+    "tempSessionSince": null,
+    "createdAt": "2024-03-01T12:00:00.000Z",
+    "lastMessage": null
+  }
+]
+```
+
+---
+
+## DELETE /chat/conversations/:id
+
+Permanently delete a conversation and all its messages. Only the conversation owner can delete group conversations. Either member can delete a direct conversation.
+
+**Method:** `DELETE`  
+**Path:** `/chat/conversations/:id`  
+**Auth:** Bearer token required  
+**Response:** `204 No Content`
+
+### Path parameters
+
+<ParamField path="id" type="string" required>
+  UUID of the conversation to delete.
+</ParamField>
+
+### Example
+
+```bash
+curl -X DELETE https://api.relay.example/chat/conversations/conv-0000-0000-0000-000000000001 \
+  -H "Authorization: Bearer $TOKEN"
+```
+
+---
+
+## GET /chat/conversations/:id/key
+
+Retrieve the authenticated user's wrapped copy of the conversation's symmetric encryption key. Decrypt this locally using your private exchange key to obtain the raw AES-256-GCM key for message encryption and decryption.
+
+**Method:** `GET`  
+**Path:** `/chat/conversations/:id/key`  
+**Auth:** Bearer token required
+
+### Path parameters
+
+<ParamField path="id" type="string" required>
+  UUID of the conversation.
+</ParamField>
+
+### Response
+
+<ResponseField name="wrappedKey" type="string | null" required>
+  The caller's wrapped conversation key, or `null` if no key has been stored for this member yet.
+</ResponseField>
+
+### Example
+
+```bash
+curl https://api.relay.example/chat/conversations/conv-0000-0000-0000-000000000001/key \
+  -H "Authorization: Bearer $TOKEN"
+```
+
+```json
+{
+  "wrappedKey": "base64-encoded-wrapped-aes-key=="
+}
+```
+
+---
+
+## POST /chat/conversations/:id/keys
+
+Upsert wrapped conversation keys for one or more members. Use this endpoint to provision keys for members who were added before keys were distributed, or to re-wrap keys after a key rotation.
+
+**Method:** `POST`  
+**Path:** `/chat/conversations/:id/keys`  
+**Auth:** Bearer token required; caller must be a member of the conversation
+
+### Path parameters
+
+<ParamField path="id" type="string" required>
+  UUID of the conversation.
+</ParamField>
+
+### Request body
+
+<ParamField body="wrappedKeys" type="object" required>
+  Map of `userId → wrappedKey`. Each value is the conversation's AES-256-GCM key wrapped with the corresponding user's X25519 public key. Existing entries for a user are overwritten; entries for other users are left unchanged.
+</ParamField>
+
+### Response
+
+<ResponseField name="ok" type="boolean" required>
+  Always `true` on success.
+</ResponseField>
+
+### Example
+
+```bash
+curl -X POST https://api.relay.example/chat/conversations/conv-0000-0000-0000-000000000001/keys \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "wrappedKeys": {
+      "b2c3d4e5-0000-0000-0000-000000000002": "new-wrapped-key-for-bob==",
+      "c3d4e5f6-0000-0000-0000-000000000003": "new-wrapped-key-for-carol=="
+    }
+  }'
+```
+
+```json
+{ "ok": true }
+```

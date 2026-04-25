@@ -1,0 +1,142 @@
+---
+title: "Encrypted media upload via Cloudinary"
+description: "How to obtain a signed Cloudinary upload URL from the Relay backend and upload an AES-encrypted file blob so the server never receives the plaintext."
+---
+
+Relay treats media files the same way it treats messages: the server is a relay, not a vault. Before a file ever leaves the browser, the client encrypts it with a randomly generated AES key. Only the encrypted blob reaches Cloudinary's storage. The decryption key travels inside a normal chat message — itself encrypted with the conversation key — so only conversation members can recover the file.
+
+<Note>
+  Cloudinary only ever receives encrypted bytes. The plaintext file never leaves the browser, and Cloudinary has no way to decrypt it.
+</Note>
+
+---
+
+## Backend endpoint
+
+The media module exposes a single health-check endpoint today, with the signed-upload endpoint arriving in milestone M5.
+
+### `GET /media/health`
+
+Returns a liveness check for the media module. No authentication is required.
+
+**Response**
+
+```json
+{ "ok": true }
+```
+
+### `GET /media/signed-url` _(M5, upcoming)_
+
+Returns a short-lived signed URL and the accompanying upload parameters needed to POST an encrypted blob directly to Cloudinary from the browser. The backend signs the request using its Cloudinary API secret so the client never holds that secret.
+
+**Authentication:** requires a valid JWT access token in the `Authorization: Bearer <token>` header.
+
+**Request parameters:** none required. The backend derives the upload preset and folder from its own configuration.
+
+**Response fields**
+
+| Field | Type | Description |
+|---|---|---|
+| `url` | `string` | The Cloudinary upload endpoint URL to POST the file to |
+| `fields` | `object` | Form fields to include in the multipart upload (includes `signature`, `timestamp`, `api_key`, and `upload_preset`) |
+| `expiresAt` | `string` | ISO 8601 timestamp after which the signed URL is no longer valid |
+
+---
+
+## Upload flow
+
+The full media-sharing flow involves the browser, the Relay backend, and Cloudinary. The backend is involved only twice: once to issue a signed URL, and once to receive a chat message whose plaintext carries the download location and the decryption key.
+
+<Steps>
+
+  <Step title="Generate a random file encryption key">
+    Create a 256-bit key using the Web Crypto API. This key is used only for this file and is never reused.
+
+    ```ts
+    const fileKey = crypto.getRandomValues(new Uint8Array(32));
+    ```
+  </Step>
+
+  <Step title="Encrypt the file client-side">
+    Read the file as an `ArrayBuffer` and encrypt it with AES-256-GCM. Generate a random 12-byte nonce for the operation.
+
+    ```ts
+    const fileBytes = await file.arrayBuffer();
+    const { ciphertext, nonce } = await encryptFile(fileKey, new Uint8Array(fileBytes));
+    // encryptFile is a libsodium-wrappers helper using crypto_secretbox or AES-GCM
+    ```
+  </Step>
+
+  <Step title="Request a signed upload URL from the backend">
+    Call the backend to get a short-lived, pre-signed Cloudinary URL. The backend signs it with its Cloudinary API secret so your client never handles that credential.
+
+    ```ts
+    const { url, fields } = await fetch('/media/signed-url', {
+      headers: { Authorization: `Bearer ${accessToken}` },
+    }).then((r) => r.json());
+    ```
+  </Step>
+
+  <Step title="Upload the encrypted blob to Cloudinary">
+    POST the encrypted bytes directly to Cloudinary using the signed URL and the accompanying form fields. Cloudinary stores the ciphertext and returns a permanent URL.
+
+    ```ts
+    const form = new FormData();
+    for (const [key, value] of Object.entries(fields)) {
+      form.append(key, value as string);
+    }
+    form.append('file', new Blob([ciphertext]));
+
+    const res = await fetch(url, { method: 'POST', body: form });
+    const { secure_url: cloudinaryUrl } = await res.json();
+    ```
+  </Step>
+
+  <Step title="Compose and encrypt the chat message">
+    Construct a plaintext JSON payload that bundles the Cloudinary URL, the file encryption key (base64-encoded), the MIME type, and the file size. This plaintext is then encrypted with the conversation key using the standard `chat:send` path — the server sees only ciphertext.
+
+    ```ts
+    const plaintext = JSON.stringify({
+      cloudinaryUrl,
+      fileKey: toBase64(fileKey),
+      mime: file.type,
+      size: file.size,
+    });
+
+    // Encrypt with the shared conversation key, then send over the socket
+    const { ciphertext, nonce } = encryptMessage(conversationKey, plaintext);
+
+    socket.emit('chat:send', { conversationId, ciphertext, nonce });
+    ```
+  </Step>
+
+</Steps>
+
+---
+
+## Recipient decryption flow
+
+When a recipient receives a `message:new` event whose plaintext (after decryption) parses as a JSON object with a `cloudinaryUrl` field, it is a media message.
+
+```ts
+socket.on('message:new', async (msg: StoredMessage) => {
+  const plaintext = decryptMessage(conversationKey, msg.ciphertext, msg.nonce);
+  const parsed = tryParseJson(plaintext);
+
+  if (parsed?.cloudinaryUrl) {
+    // It's a media message
+    const encryptedBlob = await fetch(parsed.cloudinaryUrl).then((r) => r.arrayBuffer());
+    const fileKey = fromBase64(parsed.fileKey);
+    const fileBytes = await decryptFile(fileKey, new Uint8Array(encryptedBlob));
+    renderMedia(fileBytes, parsed.mime);
+  }
+});
+```
+
+<Warning>
+  The `fileKey` inside the message plaintext is the sole way to decrypt the file. If the conversation key is lost, the file is permanently unrecoverable. Relay does not implement key escrow or server-side recovery.
+</Warning>
+
+<Tip>
+  Validate `parsed.size` against `encryptedBlob.byteLength` before decrypting to detect truncated or corrupted uploads early.
+</Tip>

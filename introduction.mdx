@@ -1,0 +1,65 @@
+---
+title: "Relay: End-to-End Encrypted Chat"
+description: "Relay is a real-time E2EE chat app with WebRTC calls and encrypted media. Messages are encrypted in your browser — the server never sees plaintext."
+---
+
+Relay is a full-stack end-to-end encrypted chat application built with Next.js and NestJS. Every message is encrypted in the browser using libsodium before it leaves your device — the server stores only ciphertext and can never read your conversations.
+
+<CardGroup cols={2}>
+  <Card title="Quick Start" icon="rocket" href="/quickstart">
+    Run Relay locally in minutes with or without a database
+  </Card>
+  <Card title="Architecture" icon="sitemap" href="/architecture">
+    Understand how the client, server, and crypto layer fit together
+  </Card>
+  <Card title="Encryption" icon="lock" href="/features/encryption">
+    Learn how X25519 key exchange and AES-256-GCM protect every message
+  </Card>
+  <Card title="API Reference" icon="code" href="/api/auth/signup">
+    Explore the full REST and WebSocket API surface
+  </Card>
+</CardGroup>
+
+## What Relay does
+
+Relay provides secure, real-time communication with a strong privacy guarantee:
+
+- **End-to-end encrypted messaging** — AES-256-GCM encryption with per-conversation keys that the server never unwraps
+- **Group conversations** — create group chats where each member gets their own wrapped copy of the conversation key
+- **Temporary Chat mode** — enable ephemeral sessions where messages are never written to the database and are purged when the session ends
+- **Encrypted media** — upload files encrypted client-side; the server stores only a Cloudinary URL, never the plaintext bytes
+- **WebRTC 1:1 calls** — peer-to-peer audio and video calls that never touch the server; Relay relays only the signaling
+
+## What the server sees
+
+Relay is designed so that a compromised server learns as little as possible:
+
+| Data | Server sees |
+|---|---|
+| Messages | Ciphertext + nonce only |
+| Media files | Cloudinary URL of the encrypted blob |
+| Keys | Only the public halves; private keys stay in your browser's IndexedDB |
+| Metadata | Who talks to whom, when, and message size |
+
+<Note>
+Relay does not provide forward secrecy. If a conversation key is ever leaked, all history encrypted under that key is readable. See the [encryption page](/features/encryption) for the full threat model.
+</Note>
+
+## Design patterns
+
+Relay is also a study project demonstrating six classical design patterns applied to real problems:
+
+<CardGroup cols={2}>
+  <Card title="Strategy Pattern" icon="shuffle" href="/patterns/strategy">
+    Pluggable chat storage — Postgres or in-memory with zero code changes
+  </Card>
+  <Card title="Observer Pattern" icon="bell" href="/patterns/observer">
+    RxJS subjects decouple message persistence from WebSocket broadcasting
+  </Card>
+  <Card title="Factory & Builder" icon="hammer" href="/patterns/factory-builder">
+    MessageFactory and MessageBuilder for type-safe message construction
+  </Card>
+  <Card title="Singleton & Decorator" icon="layer-group" href="/patterns/singleton-decorator">
+    PrismaService singleton and NestJS metadata decorators
+  </Card>
+</CardGroup>

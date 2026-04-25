@@ -1,0 +1,208 @@
+---
+title: "Strategy pattern: pluggable chat storage"
+description: "ChatStorageStrategy puts one interface in front of Prisma and in-memory Maps. Relay runs without a database by changing a single NestJS provider registration."
+---
+
+Relay's chat service needs to persist messages, conversations, and encryption keys — but not every environment has a database. Graders running the project locally, developers working offline, and users creating a "Temporary Chat" all need the app to function without Postgres. The Strategy pattern solves this by placing a single abstract class in front of all storage operations. The rest of the codebase — the gateway, controllers, and service — calls only that interface. The concrete implementation is chosen at boot time by a provider in `ChatModule`.
+
+## The problem
+
+Without the Strategy pattern, `ChatService` would call `prisma.message.create(...)` and `prisma.conversation.findMany(...)` directly. Running the app without `DATABASE_URL` set would crash immediately. Offering a "Temporary Chat" mode — where messages are never written to Postgres — would require a parallel code path in every method. Every new storage requirement would mean editing the service itself.
+
+## The interface
+
+`ChatStorageStrategy` is an abstract class rather than a TypeScript interface because NestJS's dependency injection works with class tokens, not interface tokens.
+
+```typescript chat-storage.strategy.ts
+export abstract class ChatStorageStrategy {
+  abstract readonly kind: 'database' | 'in-memory' | 'dispatching';
+
+  abstract createConversation(
+    input: CreateConversationInput,
+  ): Promise<StoredConversation>;
+
+  abstract findConversation(id: string): Promise<StoredConversation | null>;
+
+  abstract listConversationsForUser(
+    userId: string,
+  ): Promise<StoredConversation[]>;
+
+  abstract saveMessage(input: SaveMessageInput): Promise<StoredMessage>;
+
+  abstract loadHistory(
+    conversationId: string,
+    limit?: number,
+  ): Promise<StoredMessage[]>;
+
+  abstract findDirectConversation(
+    userId1: string,
+    userId2: string,
+  ): Promise<StoredConversation | null>;
+
+  abstract addMember(conversationId: string, userId: string): Promise<void>;
+
+  abstract removeMember(conversationId: string, userId: string): Promise<void>;
+
+  abstract saveConversationKeys(
+    conversationId: string,
+    wrappedKeys: Record<string, string>,
+  ): Promise<void>;
+
+  abstract getWrappedKey(
+    conversationId: string,
+    userId: string,
+  ): Promise<string | null>;
+
+  abstract deleteMessagesSince(
+    conversationId: string,
+    since: Date,
+  ): Promise<void>;
+
+  abstract deleteConversation(id: string): Promise<void>;
+}
+```
+
+## The three implementations
+
+### DatabaseChatStrategy
+
+Backed by Prisma. Every method translates directly to a Prisma query. This is the default when `DATABASE_URL` is set and the conversation is not marked temporary.
+
+```typescript database-chat.strategy.ts
+@Injectable()
+export class DatabaseChatStrategy extends ChatStorageStrategy {
+  readonly kind = 'database' as const;
+
+  constructor(private readonly prisma: PrismaService) {
+    super();
+  }
+
+  async saveMessage(input: SaveMessageInput): Promise<StoredMessage> {
+    const msg = await this.prisma.message.create({
+      data: {
+        conversationId: input.conversationId,
+        senderId: input.senderId,
+        ciphertext: input.ciphertext,
+        nonce: input.nonce,
+      },
+    });
+    return { ...msg };
+  }
+
+  async loadHistory(conversationId: string, limit = 50): Promise<StoredMessage[]> {
+    const rows = await this.prisma.message.findMany({
+      where: { conversationId },
+      orderBy: { createdAt: 'desc' },
+      take: limit,
+    });
+    return rows.reverse().map((r) => ({ ...r }));
+  }
+}
+```
+
+### InMemoryChatStrategy
+
+Backed by plain `Map`s. No database needed. All data is lost on server restart. This implementation is used when `DATABASE_URL` is not set, or when a conversation is created with `temporary: true`.
+
+```typescript in-memory-chat.strategy.ts
+@Injectable()
+export class InMemoryChatStrategy extends ChatStorageStrategy {
+  readonly kind = 'in-memory' as const;
+
+  private readonly conversations = new Map<string, StoredConversation>();
+  private readonly messages = new Map<string, StoredMessage[]>();
+  /** conversationId → userId → wrappedKey */
+  private readonly wrappedKeys = new Map<string, Map<string, string>>();
+
+  constructor() {
+    super();
+    this.logger.warn('In-memory chat storage active — temporary/unpersisted.');
+  }
+
+  async saveMessage(input: SaveMessageInput): Promise<StoredMessage> {
+    const bucket = this.messages.get(input.conversationId);
+    if (!bucket) throw new NotFoundException('Conversation not found');
+    const msg: StoredMessage = {
+      id: randomUUID(),
+      conversationId: input.conversationId,
+      senderId: input.senderId,
+      ciphertext: input.ciphertext,
+      nonce: input.nonce,
+      createdAt: new Date(),
+    };
+    bucket.push(msg);
+    return msg;
+  }
+}
+```
+
+### DispatchingChatStrategy
+
+This is the implementation that NestJS actually injects into `ChatService`. It holds references to both `DatabaseChatStrategy` and `InMemoryChatStrategy` and routes every call to the right one per conversation ID. It maintains a `routes` map so lookups after the first are O(1).
+
+```typescript dispatching-chat.strategy.ts
+@Injectable()
+export class DispatchingChatStrategy extends ChatStorageStrategy {
+  readonly kind = 'dispatching' as const;
+
+  private readonly routes = new Map<string, ChatStorageStrategy>();
+  private readonly dbEnabled: boolean;
+
+  constructor(
+    private readonly db: DatabaseChatStrategy,
+    private readonly mem: InMemoryChatStrategy,
+  ) {
+    super();
+    this.dbEnabled = Boolean(process.env.DATABASE_URL);
+  }
+
+  async createConversation(input: CreateConversationInput): Promise<StoredConversation> {
+    const target = input.temporary || !this.dbEnabled ? this.mem : this.db;
+    const conv = await target.createConversation(input);
+    this.routes.set(conv.id, target);
+    return conv;
+  }
+
+  async saveMessage(input: SaveMessageInput): Promise<StoredMessage> {
+    const strategy = await this.requireRoute(input.conversationId);
+    return strategy.saveMessage(input);
+  }
+}
+```
+
+## How the provider picks an implementation at runtime
+
+`ChatModule` registers all three implementations and then aliases the `CHAT_STORAGE` injection token to `DispatchingChatStrategy`. The dispatching strategy itself consults `process.env.DATABASE_URL` and the `temporary` flag on the conversation to decide which leaf strategy to use.
+
+```typescript chat.module.ts
+providers: [
+  ChatService,
+  ChatGateway,
+  DatabaseChatStrategy,
+  InMemoryChatStrategy,
+  DispatchingChatStrategy,
+  { provide: CHAT_STORAGE, useExisting: DispatchingChatStrategy },
+],
+```
+
+The routing logic inside `DispatchingChatStrategy` follows this decision tree:
+
+```
+if (!process.env.DATABASE_URL)          → InMemoryChatStrategy
+else if (conversation.temporary === true) → InMemoryChatStrategy
+else                                    → DatabaseChatStrategy
+```
+
+`DispatchingChatStrategy` also uses the `mem_` ID prefix as a fast path: any conversation ID that starts with `mem_` was created by `InMemoryChatStrategy` and routes there without a database lookup.
+
+## The "Temporary Chat" toggle
+
+Users can enable temporary mode on any existing conversation via the UI toggle. When enabled, `ChatService.toggleTempSession()` records the session start time. When the toggle is turned off, all messages written since the session started are deleted from storage — whether that storage is in-memory or Postgres. The `tempStarted$` and `tempEnded$` subjects notify all members in real time (see the [Observer pattern](/patterns/observer)).
+
+## Benefit
+
+The gateway, controllers, and `ChatService` call `this.storage.saveMessage(...)` and nothing else. They have no knowledge of Prisma, Maps, or routing logic. Adding a fourth storage backend — say, Redis — means implementing `ChatStorageStrategy` once and updating the provider. No other file changes.
+
+<Tip>
+  To run Relay with no database at all, simply omit `DATABASE_URL` from your `.env`. The app starts, logs a warning from `InMemoryChatStrategy`, and is fully functional for development and demos.
+</Tip>

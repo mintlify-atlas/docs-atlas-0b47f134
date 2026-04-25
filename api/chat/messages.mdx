@@ -1,0 +1,169 @@
+---
+title: "Message history and sending endpoints"
+description: "Fetch encrypted message history and send ciphertext messages over REST — the HTTP complement to the WebSocket real-time transport."
+---
+
+Messages in Relay are end-to-end encrypted before they leave the client. Each message body is encrypted with AES-256-GCM using the conversation's symmetric key, and the resulting `ciphertext` and `nonce` are what the server stores and returns. The server has no ability to read message content at any point. When fetching history, clients decrypt each message locally after retrieving their wrapped conversation key from `GET /chat/conversations/:id/key`.
+
+Real-time delivery happens over the WebSocket gateway using the `chat:send` event. The REST endpoints documented here provide the same send capability as an HTTP fallback, and are the canonical way to load historical messages on page load or conversation open.
+
+<Note>
+  All message content is AES-256-GCM encrypted client-side before transmission. The server stores and returns `ciphertext` and `nonce` as opaque strings and cannot decrypt them under any circumstances.
+</Note>
+
+All endpoints require a Bearer token in the `Authorization` header, and the caller must be a member of the requested conversation.
+
+---
+
+## GET /chat/conversations/:id/messages
+
+Fetch the message history for a conversation. Messages are returned in ascending chronological order (oldest first). Use the `limit` parameter to page through large histories by requesting a fixed window and then using the oldest returned `id` as a cursor in subsequent requests.
+
+**Method:** `GET`  
+**Path:** `/chat/conversations/:id/messages`  
+**Auth:** Bearer token required
+
+### Path parameters
+
+<ParamField path="id" type="string" required>
+  UUID of the conversation whose history you want to retrieve.
+</ParamField>
+
+### Query parameters
+
+<ParamField query="limit" type="integer">
+  Maximum number of messages to return. When omitted the storage layer applies its own default. Specify a value to control page size. Must be a positive integer.
+</ParamField>
+
+### Response
+
+Returns an array of `StoredMessage` objects.
+
+<ResponseField name="[].id" type="string" required>
+  UUID of the message.
+</ResponseField>
+
+<ResponseField name="[].conversationId" type="string" required>
+  UUID of the conversation this message belongs to.
+</ResponseField>
+
+<ResponseField name="[].senderId" type="string" required>
+  UUID of the user who sent the message.
+</ResponseField>
+
+<ResponseField name="[].ciphertext" type="string" required>
+  Base64-encoded AES-256-GCM ciphertext of the message. Decrypt locally using the conversation key retrieved from `GET /chat/conversations/:id/key`.
+</ResponseField>
+
+<ResponseField name="[].nonce" type="string" required>
+  Base64-encoded 96-bit GCM nonce used during encryption. Required for decryption alongside `ciphertext`.
+</ResponseField>
+
+<ResponseField name="[].createdAt" type="string" required>
+  ISO 8601 timestamp of when the message was saved on the server.
+</ResponseField>
+
+### Example
+
+```bash
+curl "https://api.relay.example/chat/conversations/conv-0000-0000-0000-000000000001/messages?limit=50" \
+  -H "Authorization: Bearer $TOKEN"
+```
+
+```json
+[
+  {
+    "id": "msg-0000-0000-0000-000000000001",
+    "conversationId": "conv-0000-0000-0000-000000000001",
+    "senderId": "a1b2c3d4-0000-0000-0000-000000000001",
+    "ciphertext": "base64-encoded-ciphertext==",
+    "nonce": "base64-encoded-nonce==",
+    "createdAt": "2024-03-01T12:10:00.000Z"
+  },
+  {
+    "id": "msg-0000-0000-0000-000000000002",
+    "conversationId": "conv-0000-0000-0000-000000000001",
+    "senderId": "b2c3d4e5-0000-0000-0000-000000000002",
+    "ciphertext": "base64-encoded-ciphertext-2==",
+    "nonce": "base64-encoded-nonce-2==",
+    "createdAt": "2024-03-01T12:11:00.000Z"
+  }
+]
+```
+
+---
+
+## POST /chat/conversations/:id/messages
+
+Send a message to a conversation over REST. The message must already be encrypted client-side — supply the `ciphertext` and `nonce` produced by AES-256-GCM encryption. On success the server persists the message, returns the stored record, and fans it out to all connected WebSocket clients in the conversation via the `message:new` event.
+
+**Method:** `POST`  
+**Path:** `/chat/conversations/:id/messages`  
+**Auth:** Bearer token required
+
+### Path parameters
+
+<ParamField path="id" type="string" required>
+  UUID of the conversation to send the message to.
+</ParamField>
+
+### Request body
+
+<ParamField body="ciphertext" type="string" required>
+  Base64-encoded AES-256-GCM ciphertext of the message content. Must be between 1 and 8192 characters.
+</ParamField>
+
+<ParamField body="nonce" type="string" required>
+  Base64-encoded 96-bit GCM nonce used to encrypt the message. Must be between 1 and 64 characters. **Never reuse a nonce** with the same key.
+</ParamField>
+
+### Response
+
+Returns the persisted `StoredMessage` object.
+
+<ResponseField name="id" type="string" required>
+  UUID assigned to the new message.
+</ResponseField>
+
+<ResponseField name="conversationId" type="string" required>
+  UUID of the conversation.
+</ResponseField>
+
+<ResponseField name="senderId" type="string" required>
+  UUID of the authenticated user who sent the message.
+</ResponseField>
+
+<ResponseField name="ciphertext" type="string" required>
+  The stored ciphertext, echoed back.
+</ResponseField>
+
+<ResponseField name="nonce" type="string" required>
+  The stored nonce, echoed back.
+</ResponseField>
+
+<ResponseField name="createdAt" type="string" required>
+  ISO 8601 timestamp of when the message was saved.
+</ResponseField>
+
+### Example
+
+```bash
+curl -X POST https://api.relay.example/chat/conversations/conv-0000-0000-0000-000000000001/messages \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "ciphertext": "base64-encoded-ciphertext==",
+    "nonce": "base64-encoded-nonce=="
+  }'
+```
+
+```json
+{
+  "id": "msg-0000-0000-0000-000000000003",
+  "conversationId": "conv-0000-0000-0000-000000000001",
+  "senderId": "a1b2c3d4-0000-0000-0000-000000000001",
+  "ciphertext": "base64-encoded-ciphertext==",
+  "nonce": "base64-encoded-nonce==",
+  "createdAt": "2024-03-01T12:15:00.000Z"
+}
+```

@@ -1,0 +1,196 @@
+---
+title: "Factory and Builder patterns for messages"
+description: "MessageFactory eliminates gateway type switches; MessageBuilder's fluent API structurally guarantees encryption is always the final step before sending."
+---
+
+Constructing a chat message in Relay involves decisions that grow in complexity as the feature set expands: what type of message is it, does it have an attachment, does it reply to another message, and when exactly should it be encrypted? Two patterns address these concerns at different layers of the stack. On the server, `MessageFactory` eliminates a sprawling type switch in the gateway. On the client, `MessageBuilder` replaces a difficult multi-argument constructor with a readable, validated fluent API.
+
+<Info>
+  `MessageFactory` and `MessageBuilder` are specified in the project design plan and are the next implementation step. The code examples below illustrate the intended API as designed. Check the repository for the current implementation status.
+</Info>
+
+<Tabs>
+  <Tab title="Factory pattern">
+
+## The problem
+
+Without a factory, the WebSocket gateway handles message creation with inline logic for every variant:
+
+```typescript
+// Without MessageFactory — what the gateway would look like
+switch (payload.type) {
+  case 'text':
+    if (!payload.text) throw new WsException('text required');
+    message = { type: 'text', text: payload.text, ... };
+    break;
+  case 'media':
+    if (!payload.url) throw new WsException('url required');
+    message = { type: 'media', url: payload.url, mime: payload.mime, ... };
+    break;
+  case 'system':
+    message = { type: 'system', body: payload.body, ... };
+    break;
+  default:
+    throw new WsException('unknown type');
+}
+```
+
+Adding a new message variant means editing the gateway, the REST controller, and any serialization logic scattered across the codebase.
+
+## Implementation
+
+`MessageFactory.create(type, payload)` returns one of three concrete message objects — `TextMessage`, `MediaMessage`, or `SystemMessage` — each responsible for its own validation and serialization. The gateway calls the factory and forwards the result; it has no knowledge of variant-specific fields.
+
+```typescript message.factory.ts
+export class MessageFactory {
+  static create(
+    type: 'text' | 'media' | 'system',
+    payload: Record<string, unknown>,
+  ): TextMessage | MediaMessage | SystemMessage {
+    switch (type) {
+      case 'text':
+        return TextMessage.from(payload);
+      case 'media':
+        return MediaMessage.from(payload);
+      case 'system':
+        return SystemMessage.from(payload);
+      default:
+        throw new Error(`Unknown message type: ${type}`);
+    }
+  }
+}
+```
+
+Each concrete class encapsulates its own shape:
+
+```typescript
+export class TextMessage {
+  readonly type = 'text' as const;
+  constructor(readonly text: string) {
+    if (!text?.trim()) throw new Error('text is required');
+  }
+  static from(payload: Record<string, unknown>) {
+    return new TextMessage(payload.text as string);
+  }
+}
+
+export class MediaMessage {
+  readonly type = 'media' as const;
+  constructor(
+    readonly url: string,
+    readonly mime: string,
+    readonly size: number,
+  ) {}
+  static from(payload: Record<string, unknown>) {
+    return new MediaMessage(
+      payload.url as string,
+      payload.mime as string,
+      payload.size as number,
+    );
+  }
+}
+
+export class SystemMessage {
+  readonly type = 'system' as const;
+  constructor(readonly body: string) {}
+  static from(payload: Record<string, unknown>) {
+    return new SystemMessage(payload.body as string);
+  }
+}
+```
+
+## Benefit
+
+Adding a fourth message variant — for example, a `ReactionMessage` — means creating one new class and adding one `case` to the factory. The gateway, the REST controller, and all other consumers require no changes.
+
+  </Tab>
+  <Tab title="Builder pattern">
+
+## The problem
+
+Constructing a message on the client requires several optional fields that must be assembled in the right order — and encryption must always happen last, after all content is finalised. Without a builder, the call site looks like this:
+
+```typescript
+// Without MessageBuilder — fragile, order-sensitive
+const msg = new Message(
+  'hello',        // text
+  null,           // attachment
+  null,           // replyTo
+  conversationKey, // must be last, easy to forget
+  nonce,
+  recipients,
+);
+```
+
+Six positional arguments with `null` placeholders are unreadable and error-prone. More importantly, nothing enforces that `conversationKey` is applied after the content is set.
+
+## Implementation
+
+`MessageBuilder` provides a fluent API. Each method returns `this`, enabling method chaining. The `.build()` method performs validation and applies encryption — guaranteeing it is always the final step before the payload is sent to the server.
+
+```typescript message.builder.ts
+export class MessageBuilder {
+  private _text?: string;
+  private _attachment?: File;
+  private _replyTo?: string;
+  private _conversationKey?: CryptoKey;
+
+  text(value: string): this {
+    this._text = value;
+    return this;
+  }
+
+  attach(file: File): this {
+    this._attachment = file;
+    return this;
+  }
+
+  replyTo(messageId: string): this {
+    this._replyTo = messageId;
+    return this;
+  }
+
+  encryptFor(conversationKey: CryptoKey): this {
+    this._conversationKey = conversationKey;
+    return this;
+  }
+
+  async build(): Promise<EncryptedMessagePayload> {
+    if (!this._text && !this._attachment) {
+      throw new Error('A message must have text or an attachment');
+    }
+    if (!this._conversationKey) {
+      throw new Error('encryptFor() must be called before build()');
+    }
+    // Encryption is the last step — enforced structurally
+    const plaintext = JSON.stringify({
+      text: this._text,
+      replyTo: this._replyTo,
+    });
+    const { ciphertext, nonce } = await encrypt(plaintext, this._conversationKey);
+    return { ciphertext, nonce };
+  }
+}
+```
+
+The call site from `plan.md` shows how this reads at the usage point:
+
+```typescript
+await new MessageBuilder()
+  .text('hello')
+  .attach(file)
+  .replyTo(messageId)
+  .encryptFor(conversationKey)
+  .build();
+```
+
+## Benefit
+
+Method names make the intent of each argument clear. Fields not relevant to a particular message type are simply omitted rather than passed as `null`. Validation in `.build()` catches missing fields before the socket send. Because `.encryptFor()` only stores the key and `.build()` applies it, encryption is structurally guaranteed to be the last operation — it is impossible to forget.
+
+<Warning>
+  Always call `.encryptFor(conversationKey)` before `.build()`. The builder throws if the key is missing, rather than sending plaintext silently.
+</Warning>
+
+  </Tab>
+</Tabs>

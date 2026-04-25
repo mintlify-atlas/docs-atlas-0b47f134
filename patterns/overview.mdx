@@ -1,0 +1,36 @@
+---
+title: "Design patterns used in Relay"
+description: "How Relay applies six design patterns — Strategy, Observer, Factory, Builder, Singleton, Decorator — to real problems in the chat backend and frontend."
+---
+
+Relay uses six classic design patterns, each applied to a real problem in the codebase rather than adopted for its own sake. The patterns span both the NestJS backend and the Next.js client: some govern how data is stored, some govern how events propagate across the WebSocket layer, and some keep authentication concerns from leaking into business logic. The Prototype pattern was considered and deliberately skipped — there was no honest use case for it.
+
+## Pattern summary
+
+| Pattern | Problem solved | File location |
+|---|---|---|
+| **Strategy** | Swap chat storage (Prisma vs in-memory) without touching the rest of the app | `relay-backend/src/chat/storage/` |
+| **Observer** | Decouple database writes from Socket.io broadcasting via RxJS Subjects | `relay-backend/src/chat/chat.service.ts`, `chat.gateway.ts` |
+| **Factory** | Eliminate a sprawling `switch` in the gateway when creating message variants | `relay-backend/src/chat/` _(designed, implementation pending)_ |
+| **Builder** | Replace a 6-argument message constructor with a readable fluent API | `relay-app/lib/` _(designed, implementation pending)_ |
+| **Singleton** | One database connection pool; one in-browser key cache | `relay-backend/src/common/prisma.service.ts` |
+| **Decorator** | Keep auth/extraction logic out of route handlers | `relay-backend/src/common/decorators/current-user.decorator.ts` |
+
+<CardGroup cols={2}>
+  <Card title="Strategy" href="/patterns/strategy" icon="shuffle">
+    Pluggable chat storage lets the app run without a database. Swap Prisma for in-memory Maps with a single provider change.
+  </Card>
+  <Card title="Observer" href="/patterns/observer" icon="bell">
+    RxJS Subjects in ChatService decouple persistence from Socket.io broadcasting, so new subscribers attach without changing the publish site.
+  </Card>
+  <Card title="Factory and Builder" href="/patterns/factory-builder" icon="wrench">
+    MessageFactory routes on message type; MessageBuilder provides a fluent API that guarantees encryption is always the last step.
+  </Card>
+  <Card title="Singleton and Decorator" href="/patterns/singleton-decorator" icon="lock">
+    PrismaService is instantiated once per process; custom decorators like @CurrentUser() keep authentication plumbing out of handler bodies.
+  </Card>
+</CardGroup>
+
+<Note>
+  Prototype was intentionally skipped. Relay has no honest use case for cloning object graphs, and using six patterns well is more valuable than forcing a seventh.
+</Note>

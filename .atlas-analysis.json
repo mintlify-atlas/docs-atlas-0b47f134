@@ -1,23 +1,11 @@
 {
-  "$schema": "https://mintlify.com/docs.json",
-  "name": "Relay",
+  "projectType": "saas",
+  "projectName": "Relay",
+  "projectDescription": "Relay is an end-to-end encrypted chat web app featuring real-time messaging, WebRTC audio/video calls, and encrypted media sharing, built with Next.js and NestJS.",
   "theme": "luma",
-  "colors": {
-    "primary": "#6366F1",
-    "light": "#EEF2FF",
-    "dark": "#312E81"
-  },
-  "navbar": {
-    "primary": {
-      "type": "github",
-      "href": "https://github.com/humzasadiq/DesignPattern"
-    }
-  },
-  "footer": {
-    "socials": {
-      "github": "https://github.com/humzasadiq/DesignPattern"
-    }
-  },
+  "primaryColor": "#6366F1",
+  "lightColor": "#EEF2FF",
+  "darkColor": "#312E81",
   "navigation": {
     "tabs": [
       {
@@ -97,5 +85,49 @@
         ]
       }
     ]
-  }
+  },
+  "keyFeatures": [
+    "End-to-end encryption using libsodium (X25519 ECDH + AES-256-GCM)",
+    "Real-time messaging via Socket.io with room-based delivery",
+    "WebRTC peer-to-peer audio/video calls with signaling relay",
+    "Encrypted media uploads via Cloudinary signed URLs",
+    "Temporary Chat mode — messages never persisted to database",
+    "Group conversations with per-member wrapped conversation keys",
+    "JWT authentication with httpOnly refresh cookie rotation",
+    "Pluggable storage via Strategy pattern (Postgres or in-memory)"
+  ],
+  "publicApiSurface": [
+    "POST /auth/signup",
+    "POST /auth/login",
+    "POST /auth/refresh",
+    "POST /auth/logout",
+    "GET /auth/me",
+    "GET /users/search",
+    "PATCH /users/me",
+    "PUT /users/me/keys",
+    "GET /users/me/keys",
+    "GET /users/:id/keys",
+    "POST /chat/conversations",
+    "GET /chat/conversations",
+    "DELETE /chat/conversations/:id",
+    "POST /chat/conversations/:id/members",
+    "DELETE /chat/conversations/:id/members/:userId",
+    "GET /chat/conversations/:id/key",
+    "POST /chat/conversations/:id/keys",
+    "GET /chat/conversations/:id/messages",
+    "POST /chat/conversations/:id/messages",
+    "WS chat:join",
+    "WS chat:leave",
+    "WS chat:send",
+    "WS temp:toggle",
+    "WS call:offer",
+    "WS call:answer",
+    "WS call:ice-candidate",
+    "WS call:reject",
+    "WS call:hangup",
+    "ChatStorageStrategy (abstract class)",
+    "DatabaseChatStrategy",
+    "InMemoryChatStrategy",
+    "DispatchingChatStrategy"
+  ]
 }

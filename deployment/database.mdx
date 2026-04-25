@@ -1,0 +1,163 @@
+---
+title: "Database setup and schema"
+description: "Set up Postgres for Relay using Neon's free tier, run Prisma migrations, and understand the schema design that keeps the server blind to plaintext."
+---
+
+Relay uses PostgreSQL as its durable store, accessed through Prisma ORM. The schema is intentionally minimal: the server stores only ciphertext, nonces, and public key material — it cannot read a single message even with full database access. If you want to skip the database entirely during development, see [Running without a database](#running-without-a-database) in the running guide.
+
+## Setting up Postgres
+
+[Neon](https://neon.tech) is the recommended option for getting a free Postgres instance without running anything locally. It provides a connection string you paste directly into `DATABASE_URL`.
+
+<Steps>
+  <Step title="Create a Neon project">
+    Go to [neon.tech](https://neon.tech), sign in, and create a new project. Choose a region close to where your backend will be deployed. Neon will provision a Postgres database and display a connection string.
+  </Step>
+  <Step title="Copy the connection string">
+    From the Neon dashboard, copy the connection string. It will look like:
+
+    ```
+    postgresql://user:password@ep-xyz.us-east-2.aws.neon.tech/neondb?sslmode=require
+    ```
+
+    Paste it into `relay-backend/.env` as the value of `DATABASE_URL`.
+  </Step>
+  <Step title="Install dependencies">
+    From the `relay-backend` directory, install Node dependencies (including the Prisma CLI):
+
+    ```bash
+    npm install
+    ```
+  </Step>
+  <Step title="Run migrations">
+    Apply the schema to your database. Use `migrate deploy` in production or CI, and `migrate dev` in development (which also generates the Prisma client and prompts for a migration name on schema changes):
+
+    <CodeGroup>
+    ```bash Production / CI
+    npx prisma migrate deploy
+    ```
+
+    ```bash Development
+    npx prisma migrate dev
+    ```
+    </CodeGroup>
+
+    A successful run prints each migration name and confirms it was applied. There is currently one migration: `20260414204821_init`.
+  </Step>
+  <Step title="Verify the connection">
+    Open Prisma Studio to confirm the tables exist and the connection is healthy:
+
+    ```bash
+    npx prisma studio
+    ```
+
+    A browser window opens at `http://localhost:5555` showing all eight tables.
+  </Step>
+</Steps>
+
+## Running without a database
+
+Leave `DATABASE_URL` empty in your `.env` file. The backend detects the missing variable at startup and automatically switches to `InMemoryChatStrategy`, which stores all conversation data in plain JavaScript `Map`s. No migrations are needed. All data is wiped when the server restarts.
+
+This mode is suitable for local development, demos, and grading environments where standing up a database is inconvenient.
+
+## Schema overview
+
+The schema lives in `relay-backend/prisma/schema.prisma`. All eight models are described below.
+
+```prisma schema.prisma
+model User {
+  id           String   @id @default(cuid())
+  email        String   @unique
+  displayName  String
+  avatarUrl    String?
+  passwordHash String
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+}
+
+model KeyBundle {
+  userId             String   @id
+  identityPubKey     String
+  exchangePubKey     String
+  wrappedPrivateKeys String   // opaque ciphertext blob — server cannot decrypt
+  createdAt          DateTime @default(now())
+  updatedAt          DateTime @updatedAt
+}
+
+model Conversation {
+  id        String           @id @default(cuid())
+  type      ConversationType // DIRECT | GROUP
+  name      String?
+  createdAt DateTime         @default(now())
+}
+
+model Membership {
+  userId         String
+  conversationId String
+  role           MembershipRole @default(MEMBER) // OWNER | ADMIN | MEMBER
+  joinedAt       DateTime       @default(now())
+
+  @@id([userId, conversationId])
+}
+
+model ConversationKey {
+  userId         String
+  conversationId String
+  wrappedKey     String   // this user's AES-KW-wrapped copy of the conversation key
+  createdAt      DateTime @default(now())
+
+  @@id([userId, conversationId])
+}
+
+model Message {
+  id             String   @id @default(cuid())
+  conversationId String
+  senderId       String
+  ciphertext     String
+  nonce          String
+  createdAt      DateTime @default(now())
+
+  @@index([conversationId, createdAt])
+}
+
+model MediaAsset {
+  id            String   @id @default(cuid())
+  messageId     String
+  cloudinaryUrl String
+  mime          String
+  size          Int
+  createdAt     DateTime @default(now())
+}
+
+model Session {
+  id               String   @id @default(cuid())
+  userId           String
+  refreshTokenHash String   @unique
+  expiresAt        DateTime
+  createdAt        DateTime @default(now())
+
+  @@index([userId])
+}
+```
+
+### Model descriptions
+
+| Model | Purpose |
+|---|---|
+| `User` | Core identity record. Holds credentials (`passwordHash`) and display information. Linked to all other models. |
+| `KeyBundle` | Public key material uploaded by the client on signup: an Ed25519 identity key and an X25519 exchange key. Also stores `wrappedPrivateKeys` — an opaque ciphertext blob the server cannot read. |
+| `Conversation` | A chat thread, either `DIRECT` (two participants) or `GROUP` (many). Has an optional display name for group chats. |
+| `Membership` | Join table between `User` and `Conversation`. Tracks the member's `role` (`OWNER`, `ADMIN`, or `MEMBER`) and the time they joined. |
+| `ConversationKey` | Each member's personal copy of the conversation's AES-256-GCM symmetric key, wrapped with that member's public key via X25519 ECDH + HKDF + AES-KW. The server stores `wrappedKey` but cannot unwrap it. |
+| `Message` | A single sent message. Contains only `ciphertext` and `nonce` — never plaintext. Indexed on `(conversationId, createdAt)` for efficient history queries. |
+| `MediaAsset` | Plaintext metadata (URL, MIME type, size) for an attached file. The file bytes on Cloudinary are already encrypted by the client before upload; the server only knows where to find them. |
+| `Session` | A server-side refresh token record. Stores a bcrypt hash of the token, not the token itself. Used to invalidate sessions on logout or token rotation. |
+
+## Key design decisions
+
+**The server stores ciphertext only.** Every `Message` row contains `ciphertext` and `nonce` — the output of `AES-256-GCM` applied client-side. Without the conversation key, the server cannot recover the plaintext. The same principle applies to media: clients encrypt files before uploading to Cloudinary, and the server only records the URL.
+
+**`wrappedPrivateKeys` is an opaque blob.** `KeyBundle.wrappedPrivateKeys` holds the user's Ed25519 and X25519 private keys, encrypted with a key derived from the user's password via `argon2id` entirely in the browser. The server stores this blob so the user can restore their keys after a browser reset by re-entering their password — but it cannot read the private keys at rest.
+
+**`ConversationKey` is per-user.** When a new conversation is created, the creator generates one random AES-256-GCM key and wraps it once per member using X25519 ECDH + HKDF + AES-KW. Each `ConversationKey` row is opaque to the server; only the intended recipient can unwrap it. When membership changes (someone is added or removed), the conversation key is rotated and new `ConversationKey` rows are written for all remaining members.

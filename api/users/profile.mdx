@@ -1,0 +1,174 @@
+---
+title: "User profile endpoints"
+description: "View your own profile with GET /auth/me, update your display name with PATCH /users/me, or find another user by exact email address with GET /users/search."
+---
+
+Every request to these endpoints must include a valid JWT access token in the `Authorization` header. The token is issued by `POST /auth/login` and expires after 15 minutes by default (controlled by `JWT_ACCESS_TTL`). Profile data returned by these endpoints never includes the user's password hash or any private key material — only the fields that are safe to share with other clients.
+
+## GET /auth/me
+
+Returns the profile of the currently authenticated user. Use this endpoint on app load to hydrate the local session without an additional lookup.
+
+**Method:** `GET`  
+**Path:** `/auth/me`  
+**Auth:** Bearer token required
+
+### Response
+
+<ResponseField name="id" type="string" required>
+  UUID of the user.
+</ResponseField>
+
+<ResponseField name="email" type="string" required>
+  Email address used to register the account.
+</ResponseField>
+
+<ResponseField name="displayName" type="string" required>
+  Human-readable name shown in the chat UI.
+</ResponseField>
+
+<ResponseField name="avatarUrl" type="string | null" required>
+  URL of the user's avatar image, or `null` if none has been set.
+</ResponseField>
+
+<ResponseField name="createdAt" type="string" required>
+  ISO 8601 timestamp of when the account was created.
+</ResponseField>
+
+### Example
+
+```bash
+curl https://api.relay.example/auth/me \
+  -H "Authorization: Bearer $TOKEN"
+```
+
+```json
+{
+  "id": "a1b2c3d4-0000-0000-0000-000000000001",
+  "email": "alice@example.com",
+  "displayName": "Alice",
+  "avatarUrl": null,
+  "createdAt": "2024-01-15T10:30:00.000Z"
+}
+```
+
+---
+
+## GET /users/search
+
+Search for a Relay user by their exact email address. The response includes the user's `exchangePubKey` so that the caller can immediately initiate a Diffie-Hellman key exchange and open a direct conversation. The endpoint returns an empty array if no match is found, or if the email belongs to the authenticated user themselves.
+
+**Method:** `GET`  
+**Path:** `/users/search`  
+**Auth:** Bearer token required
+
+### Query parameters
+
+<ParamField query="email" type="string" required>
+  Exact email address to look up. Partial matches are not supported.
+</ParamField>
+
+### Response
+
+Returns an array of zero or one user objects.
+
+<ResponseField name="[].id" type="string" required>
+  UUID of the matched user.
+</ResponseField>
+
+<ResponseField name="[].email" type="string" required>
+  Email address of the matched user.
+</ResponseField>
+
+<ResponseField name="[].displayName" type="string" required>
+  Display name of the matched user.
+</ResponseField>
+
+<ResponseField name="[].avatarUrl" type="string | null" required>
+  Avatar URL of the matched user, or `null`.
+</ResponseField>
+
+<ResponseField name="[].createdAt" type="string" required>
+  ISO 8601 account creation timestamp.
+</ResponseField>
+
+<ResponseField name="[].exchangePubKey" type="string | null" required>
+  The user's X25519 public key for ECDH key exchange, or `null` if the user has not yet uploaded a key bundle. A `null` value means you cannot yet establish an encrypted session with this user.
+</ResponseField>
+
+### Example
+
+```bash
+curl "https://api.relay.example/users/search?email=bob%40example.com" \
+  -H "Authorization: Bearer $TOKEN"
+```
+
+```json
+[
+  {
+    "id": "b2c3d4e5-0000-0000-0000-000000000002",
+    "email": "bob@example.com",
+    "displayName": "Bob",
+    "avatarUrl": null,
+    "createdAt": "2024-02-01T08:00:00.000Z",
+    "exchangePubKey": "base64url-encoded-x25519-public-key=="
+  }
+]
+```
+
+---
+
+## PATCH /users/me
+
+Update the display name of the authenticated user. The response is the updated public profile.
+
+**Method:** `PATCH`  
+**Path:** `/users/me`  
+**Auth:** Bearer token required
+
+### Request body
+
+<ParamField body="displayName" type="string">
+  New display name. Must be between 2 and 40 characters. Omit the field to leave it unchanged.
+</ParamField>
+
+### Response
+
+<ResponseField name="id" type="string" required>
+  UUID of the user.
+</ResponseField>
+
+<ResponseField name="email" type="string" required>
+  Email address of the user.
+</ResponseField>
+
+<ResponseField name="displayName" type="string" required>
+  The updated display name.
+</ResponseField>
+
+<ResponseField name="avatarUrl" type="string | null" required>
+  Avatar URL, unchanged by this operation.
+</ResponseField>
+
+<ResponseField name="createdAt" type="string" required>
+  ISO 8601 account creation timestamp.
+</ResponseField>
+
+### Example
+
+```bash
+curl -X PATCH https://api.relay.example/users/me \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"displayName": "Alice Smith"}'
+```
+
+```json
+{
+  "id": "a1b2c3d4-0000-0000-0000-000000000001",
+  "email": "alice@example.com",
+  "displayName": "Alice Smith",
+  "avatarUrl": null,
+  "createdAt": "2024-01-15T10:30:00.000Z"
+}
+```

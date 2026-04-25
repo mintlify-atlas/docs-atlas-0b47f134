@@ -1,0 +1,157 @@
+---
+title: "Real-time messaging in Relay"
+description: "Send and receive encrypted messages over Socket.io, with Temporary Chat mode that keeps messages in memory only and purges them on session end."
+---
+
+Relay delivers messages in real time over a persistent Socket.io WebSocket connection. Every message payload contains only ciphertext and a nonce — the server never receives plaintext. The `ChatGateway` validates JWT credentials on connection, places each authenticated client in a personal notification room, and then routes incoming events to conversation rooms. Two storage backends operate behind the same `ChatStorageStrategy` interface: a Prisma-backed database strategy for durable conversations and an in-memory strategy used for Temporary Chat sessions.
+
+## Connecting to the WebSocket
+
+The gateway accepts connections at the root Socket.io namespace with CORS open to all origins. Pass a valid JWT access token in the handshake `auth` object.
+
+```ts
+import { io } from "socket.io-client";
+
+const socket = io("https://api.yourrelay.app", {
+  auth: { token: accessToken },
+  withCredentials: true,
+});
+```
+
+On connection the server verifies the JWT, stores `userId` and `email` on the socket, and automatically joins the client to a personal room named `user:<userId>`. Connection attempts without a valid token are rejected immediately.
+
+## Joining a conversation room
+
+Before a client can receive messages for a specific conversation it must join that conversation's Socket.io room.
+
+```ts
+// Emit
+socket.emit("chat:join", { conversationId: "clxyz123" });
+
+// Acknowledgement
+// { ok: true }
+```
+
+The server verifies that the authenticated user is a member of the conversation before calling `socket.join`. Emitting `chat:leave` reverses this.
+
+## Sending a message
+
+Messages are encrypted client-side before being sent. The `chat:send` event carries the raw ciphertext and the AES-GCM nonce used to produce it.
+
+```ts
+// Emit
+socket.emit("chat:send", {
+  conversationId: "clxyz123",
+  ciphertext: "<base64-encoded AES-256-GCM ciphertext>",
+  nonce: "<base64-encoded 12-byte random nonce>",
+});
+
+// Acknowledgement
+// { ok: true, message: { id, conversationId, senderId, ciphertext, nonce, createdAt } }
+```
+
+After persisting the message the service publishes it on its `messageCreated$` RxJS subject. The gateway subscribes to that subject and immediately broadcasts a `message:new` event to every socket in the conversation room — including the sender, so all open tabs stay consistent.
+
+```ts
+// Received by all members in the room
+socket.on("message:new", (message) => {
+  // { id, conversationId, senderId, ciphertext, nonce, createdAt }
+});
+```
+
+## Conversation types
+
+<Tabs>
+  <Tab title="Direct message">
+    A direct conversation has exactly two members. The server enforces this constraint and deduplicates: calling `POST /chat/conversations` with `type: "DIRECT"` and the same pair of member IDs returns the existing conversation rather than creating a second one.
+
+    ```json
+    {
+      "type": "DIRECT",
+      "memberIds": ["user_alice", "user_bob"],
+      "wrappedKeys": {
+        "user_alice": "<alice's wrapped copy of the conversation key>",
+        "user_bob":   "<bob's wrapped copy of the conversation key>"
+      }
+    }
+    ```
+
+    The sidebar labels a direct conversation by the other member's `displayName`, resolved at list-time and returned in the `memberNames` map on the enriched conversation object.
+  </Tab>
+  <Tab title="Group chat">
+    A group conversation requires a `name` and supports any number of members. The creator is automatically assigned the `OWNER` role. Only the owner may add or remove members.
+
+    ```json
+    {
+      "type": "GROUP",
+      "name": "Project Nighthawk",
+      "memberIds": ["user_alice", "user_bob", "user_carol"],
+      "wrappedKeys": {
+        "user_alice": "<alice's wrapped key>",
+        "user_bob":   "<bob's wrapped key>",
+        "user_carol": "<carol's wrapped key>"
+      }
+    }
+    ```
+
+    When a member is added the owner generates a fresh wrapped copy of the conversation key for that user and posts it via `POST /chat/conversations/:id/members`. The gateway broadcasts `group:member-added` to the room so existing clients can refresh their member list.
+
+    When a member is removed the gateway emits `group:kicked` to the removed user's personal room and `group:member-removed` to everyone still in the conversation, prompting key rotation.
+  </Tab>
+</Tabs>
+
+## Conversation key management
+
+Each conversation has a single random AES-256-GCM symmetric key. That key is never sent to the server in plaintext. Instead, the creator computes one wrapped copy of the key per member using X25519 ECDH key exchange and ships the entire map in the `wrappedKeys` field of the create-conversation request.
+
+The server stores each wrapped copy in the `ConversationKey` table:
+
+```prisma
+model ConversationKey {
+  userId         String
+  conversationId String
+  wrappedKey     String   // opaque to the server
+  createdAt      DateTime @default(now())
+
+  @@id([userId, conversationId])
+}
+```
+
+A member fetches their own wrapped key via `GET /chat/conversations/:id/key` and unwraps it locally using their X25519 private key. The server returns an opaque string; unwrapping happens entirely in the browser.
+
+## Temporary Chat mode
+
+Any member of a conversation can toggle a Temporary Chat session at any time.
+
+```ts
+// Emit
+socket.emit("temp:toggle", { conversationId: "clxyz123" });
+
+// Acknowledgement
+// { ok: true, started: true, since: "2024-01-15T10:30:00.000Z" }
+```
+
+The server holds the session start time in an in-memory `Map`. When the session is toggled off, `deleteMessagesSince` is called on the storage backend to purge all messages written after the session started. Every member receives real-time notifications:
+
+```ts
+socket.on("temp:started", ({ conversationId, since }) => { /* show banner */ });
+socket.on("temp:ended",   ({ conversationId, since }) => { /* clear messages */ });
+```
+
+<Note>
+  During a Temporary Chat session, messages are routed through the `InMemoryChatStrategy` backend. They are never written to Postgres and exist only in server RAM. When the session ends — or the server restarts — those messages are permanently gone. The sidebar marks temporary conversations with a `Temp` badge so all participants are aware.
+</Note>
+
+## REST fallback
+
+In addition to the WebSocket events, `ChatController` exposes HTTP endpoints for operations that don't require real-time delivery:
+
+| Method | Path | Description |
+|--------|------|-------------|
+| `POST` | `/chat/conversations` | Create a new conversation |
+| `GET` | `/chat/conversations` | List all conversations for the current user |
+| `GET` | `/chat/conversations/:id/messages` | Fetch message history |
+| `POST` | `/chat/conversations/:id/messages` | Send a message over HTTP |
+| `GET` | `/chat/conversations/:id/key` | Retrieve the caller's wrapped conversation key |
+| `POST` | `/chat/conversations/:id/keys` | Upsert wrapped keys (used after key rotation) |
+| `DELETE` | `/chat/conversations/:id` | Delete a conversation |
